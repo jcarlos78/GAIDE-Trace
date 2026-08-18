@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "GAIDE-Trace event record",
+  "description": "One line of .gaide-trace/events/<session_id>.jsonl. Empty fields are omitted.",
+  "type": "object",
+  "required": ["trace_id", "ts", "event", "session_id"],
+  "properties": {
+    "trace_id": { "type": "string", "description": "Unique id of this record" },
+    "ts": { "type": "string", "format": "date-time", "description": "UTC capture time" },
+    "event": {
+      "type": "string",
+      "description": "Claude Code hook event name",
+      "examples": ["SessionStart", "UserPromptSubmit", "PostToolUse", "PostToolUseFailure", "Stop", "SubagentStart", "SubagentStop", "PreCompact", "SessionEnd"]
+    },
+    "session_id": { "type": "string" },
+    "prompt_id": { "type": "string", "description": "Groups all events of one user turn" },
+    "cwd": { "type": "string" },
+    "permission_mode": { "type": "string" },
+    "model": { "type": "string" },
+    "agent_id": { "type": "string", "description": "Present when the event came from a subagent" },
+    "agent_type": { "type": "string" },
+    "tool_name": { "type": "string" },
+    "tool_use_id": { "type": "string" },
+    "tool_input": { "type": "string", "description": "JSON-serialized, redacted, truncated" },
+    "tool_response": { "type": "string", "description": "JSON-serialized, redacted, truncated" },
+    "prompt": { "type": "string", "description": "User prompt text (UserPromptSubmit)" },
+    "last_assistant_message": { "type": "string", "description": "Final assistant text of the turn (Stop/SubagentStop)" },
+    "transcript_path": { "type": "string", "description": "Path of the live Claude Code transcript at capture time" }
+  }
+}
