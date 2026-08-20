@@ -1,10 +1,16 @@
 #!/usr/bin/env python3
 """
-GAIDE-Trace — universal hook logger for Claude Code.
+GAIDE-Trace — Claude Code adapter (hook logger).
 
 Reads the hook event JSON from stdin and appends one normalized JSONL line
-to the trace store. Designed to be registered for multiple hook events
-(SessionStart, UserPromptSubmit, PostToolUse, Stop, SubagentStop, SessionEnd, ...).
+to the trace store, translated to the tool-agnostic canonical vocabulary
+(see schema/event.schema.json and docs/ADAPTERS.md). Designed to be
+registered for multiple hook events (SessionStart, UserPromptSubmit,
+PostToolUse, Stop, SubagentStop, SessionEnd, ...).
+
+Other tools have their own adapters (e.g. tools/import_antigravity.py for
+the Antigravity IDE); all of them write the same record shape, so stores,
+server and analyses are shared across LLMs and IDEs.
 
 Guarantees:
 - Never blocks the agent: always exits 0, even on internal errors.
@@ -45,6 +51,22 @@ from pathlib import Path
 
 SHIP_BATCH = 200          # events per upload request
 SHIP_DEADLINE = 8.0       # seconds of total network budget per hook fire
+
+SOURCE = "claude-code"
+
+# Native hook names -> canonical, tool-agnostic event vocabulary.
+# The native name is preserved in `native_event` for tool-specific analyses.
+CANONICAL_EVENTS = {
+    "SessionStart": "session.start",
+    "UserPromptSubmit": "prompt.submit",
+    "PostToolUse": "tool.call",
+    "PostToolUseFailure": "tool.fail",
+    "Stop": "turn.end",
+    "SubagentStart": "agent.start",
+    "SubagentStop": "agent.end",
+    "PreCompact": "context.compact",
+    "SessionEnd": "session.end",
+}
 
 # ---------------------------------------------------------------- redaction
 
@@ -209,10 +231,13 @@ def main() -> None:
                or Path(cwd).name)
 
     session_id = event.get("session_id") or "unknown-session"
+    native = event.get("hook_event_name") or (sys.argv[1] if len(sys.argv) > 1 else "unknown")
     record = {
         "trace_id": uuid.uuid4().hex[:12],
         "ts": datetime.now(timezone.utc).isoformat(),
-        "event": event.get("hook_event_name") or (sys.argv[1] if len(sys.argv) > 1 else "unknown"),
+        "event": CANONICAL_EVENTS.get(native, "note"),
+        "native_event": native,
+        "source": SOURCE,
         "session_id": session_id,
         "prompt_id": event.get("prompt_id"),
         "project": project,
@@ -242,7 +267,7 @@ def main() -> None:
     # retention cleanup can delete it. The transcript is the highest-fidelity
     # record (full messages, tool calls, token usage per turn).
     snapshot = None
-    if record["event"] in ("SessionEnd", "Stop"):
+    if record["event"] in ("session.end", "turn.end"):
         src = event.get("transcript_path")
         if src and Path(src).is_file():
             snap_dir = trace_dir / "transcripts"

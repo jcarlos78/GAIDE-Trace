@@ -91,7 +91,7 @@ Typical research queries this supports directly:
 
 - Tool-usage distribution per session / per task type.
 - Prompt → number of tool calls → outcome chains (via `prompt_id`).
-- Rework signals: `PostToolUseFailure` density, `PreCompact` frequency.
+- Rework signals: `tool.fail` density, `context.compact` frequency.
 - Token/cost accounting per turn (transcript layer `usage` fields).
 - Governance events: how often GAIDE hooks blocked actions (visible as
   failed/denied tool patterns).
@@ -141,6 +141,26 @@ management — while `GET /api/v1/export` keeps the data pipeline scriptable
 
 See `docs/SERVER.md` for deployment (VPS / container), backups and the API.
 
+## D9 — Tool-agnostic vocabulary, per-tool adapters
+
+v0.3 removes the last Claude Code assumption from the data model. The
+`event` field is a canonical, tool-neutral vocabulary (`session.start`,
+`prompt.submit`, `tool.call`, `tool.fail`, `model.turn`, `turn.end`,
+`agent.start/end`, `context.compact`, `session.end`, `note`); every record
+carries `source` (which adapter captured it), `native_event` (the tool's own
+name — no information is discarded) and `model` when known. Capture is done
+by per-tool adapters that share the same core (store, redaction, outbox):
+hooks where the tool has them (Claude Code, real-time), an incremental
+importer of the tool's own local session store where it doesn't (Antigravity
+IDE). Rationale: research comparing tools/LLMs needs records that differ in
+`source`, not in shape — and tools that offer no extension point can still
+be captured, because almost all of them persist sessions locally.
+
+Backward compatibility is a read-side concern: v0.2 stores/archives hold
+Claude-shaped names, and the server, console and loaders normalize them via
+one shared mapping (`LEGACY_EVENTS`) instead of rewriting data — the JSONL
+archive stays append-only and untouched (D7 holds). See `docs/ADAPTERS.md`.
+
 ## Quantitative telemetry (optional third layer)
 
 Claude Code exports OpenTelemetry metrics natively
@@ -169,6 +189,8 @@ The event schema is tool-agnostic on purpose (`event`, `session_id`,
 - v0.2 (this repo): team server — central ledger with outbox shipping,
   web console, exports, key management (D6–D8); SQLite index built from the
   JSONL (JSONL stays the source of truth).
-- v0.3: session report generator (Markdown/HTML per session), anonymization
-  pass for publishable datasets; adapters for other tools via gateway logs.
+- v0.3 (this repo): tool-agnostic canonical event vocabulary + adapter
+  model (D9); Antigravity IDE importer.
+- v0.4: session report generator (Markdown/HTML per session), anonymization
+  pass for publishable datasets; more adapters (Cursor, Codex CLI).
 - Possible packaging as a Claude Code **plugin** for one-command install.

@@ -180,6 +180,12 @@ the JSONL archive.
 
 ## 6. API (for your own tooling)
 
+**Upgrading from v0.2:** event names are now the canonical tool-agnostic
+vocabulary (see `docs/ADAPTERS.md`); legacy Claude-shaped names are
+normalized automatically at ingest, and one `python3
+server/gaide_trace_server.py rebuild-index` after upgrading normalizes the
+rows indexed before v0.3 (the JSONL archive itself is never rewritten).
+
 All endpoints under `/api/v1/`, auth via `Authorization: Bearer <token>` —
 either an API key (`gtr_...`) or a console session (`gts_...`, obtained from
 the login endpoint).

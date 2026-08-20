@@ -9,9 +9,11 @@
     "ts": { "type": "string", "format": "date-time", "description": "UTC capture time" },
     "event": {
       "type": "string",
-      "description": "Claude Code hook event name",
-      "examples": ["SessionStart", "UserPromptSubmit", "PostToolUse", "PostToolUseFailure", "Stop", "SubagentStart", "SubagentStop", "PreCompact", "SessionEnd"]
+      "description": "Canonical, tool-agnostic event name. v0.2 stores used Claude Code hook names (SessionStart, UserPromptSubmit, PostToolUse, ...); readers and the server normalize them on read via the same mapping adapters use on write.",
+      "enum": ["session.start", "prompt.submit", "tool.call", "tool.fail", "model.turn", "turn.end", "agent.start", "agent.end", "context.compact", "session.end", "note"]
     },
+    "native_event": { "type": "string", "description": "Event name in the source tool's own vocabulary (e.g. PostToolUse for Claude Code, step.15 for Antigravity)" },
+    "source": { "type": "string", "description": "Adapter that captured the record", "examples": ["claude-code", "antigravity"] },
     "session_id": { "type": "string" },
     "prompt_id": { "type": "string", "description": "Groups all events of one user turn" },
     "project": { "type": "string", "description": "Project name (GAIDE_TRACE_PROJECT, store config, or basename of cwd)" },
@@ -24,9 +26,9 @@
     "tool_use_id": { "type": "string" },
     "tool_input": { "type": "string", "description": "JSON-serialized, redacted, truncated" },
     "tool_response": { "type": "string", "description": "JSON-serialized, redacted, truncated" },
-    "prompt": { "type": "string", "description": "User prompt text (UserPromptSubmit)" },
-    "last_assistant_message": { "type": "string", "description": "Final assistant text of the turn (Stop/SubagentStop)" },
-    "transcript_path": { "type": "string", "description": "Path of the live Claude Code transcript at capture time" },
+    "prompt": { "type": "string", "description": "User prompt text (prompt.submit)" },
+    "last_assistant_message": { "type": "string", "description": "Assistant text (turn.end, agent.end, model.turn)" },
+    "transcript_path": { "type": "string", "description": "Path of the source tool\u0027s live transcript at capture time, when it has one" },
     "origin": { "type": "string", "description": "Server-side only: name of the API key that shipped the record" },
     "received_at": { "type": "string", "format": "date-time", "description": "Server-side only: UTC arrival time" }
   }

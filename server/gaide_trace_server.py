@@ -64,17 +64,43 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 
 MAX_EVENTS_BODY = 32 * 1024 * 1024        # 32 MB per events batch
 MAX_TRANSCRIPT_BODY = 256 * 1024 * 1024   # 256 MB per transcript snapshot
 
 EVENT_COLUMNS = [
-    "trace_id", "ts", "received_at", "event", "session_id", "prompt_id",
+    "trace_id", "ts", "received_at", "event", "native_event", "source",
+    "session_id", "prompt_id",
     "project", "origin", "cwd", "permission_mode", "model", "agent_id",
     "agent_type", "tool_name", "tool_use_id", "tool_input", "tool_response",
     "prompt", "last_assistant_message",
 ]
+
+# v0.2 stores shipped Claude Code hook names as `event`. Normalize to the
+# canonical tool-agnostic vocabulary at ingest/index time; the original name
+# is preserved in native_event. Old archives never need rewriting.
+LEGACY_EVENTS = {
+    "SessionStart": "session.start",
+    "UserPromptSubmit": "prompt.submit",
+    "PostToolUse": "tool.call",
+    "PostToolUseFailure": "tool.fail",
+    "Stop": "turn.end",
+    "SubagentStart": "agent.start",
+    "SubagentStop": "agent.end",
+    "PreCompact": "context.compact",
+    "SessionEnd": "session.end",
+}
+
+
+def normalize_event(row: dict):
+    """Map legacy (v0.2, Claude-shaped) event names to canonical ones."""
+    canonical = LEGACY_EVENTS.get(row.get("event"))
+    if canonical:
+        row["native_event"] = row.get("native_event") or row["event"]
+        row["source"] = row.get("source") or "claude-code"
+        row["event"] = canonical
+    return row
 
 SESSION_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 
@@ -120,6 +146,8 @@ class Store:
           ts TEXT NOT NULL,
           received_at TEXT NOT NULL,
           event TEXT NOT NULL,
+          native_event TEXT,
+          source TEXT,
           session_id TEXT NOT NULL,
           prompt_id TEXT,
           project TEXT,
@@ -185,6 +213,11 @@ class Store:
         );
         CREATE INDEX IF NOT EXISTS idx_sessions_last ON sessions(last_ts);
         """)
+        # v0.2 -> v0.3 migration: add columns if the table predates them.
+        cols = {r[1] for r in db.execute("PRAGMA table_info(events)")}
+        for col in ("native_event", "source"):
+            if col not in cols:
+                db.execute(f"ALTER TABLE events ADD COLUMN {col} TEXT")
         db.commit()
 
     # ---- events ingest ----
@@ -198,7 +231,7 @@ class Store:
             for rec in records:
                 if not isinstance(rec, dict):
                     continue
-                row = {c: rec.get(c) for c in EVENT_COLUMNS}
+                row = normalize_event({c: rec.get(c) for c in EVENT_COLUMNS})
                 if not row["trace_id"] or not row["session_id"] or not row["event"]:
                     continue
                 row["received_at"] = now
@@ -248,13 +281,13 @@ class Store:
                  last_ts = MAX(sessions.last_ts, excluded.last_ts)""",
             (row["session_id"], row["project"], row["origin"], row["ts"], row["ts"]),
         )
-        if ev == "UserPromptSubmit":
+        if ev == "prompt.submit":
             db.execute("UPDATE sessions SET prompts = prompts + 1 WHERE session_id = ?",
                        (row["session_id"],))
-        elif ev == "PostToolUse":
+        elif ev == "tool.call":
             db.execute("UPDATE sessions SET tool_calls = tool_calls + 1 WHERE session_id = ?",
                        (row["session_id"],))
-        elif ev == "PostToolUseFailure":
+        elif ev == "tool.fail":
             db.execute("UPDATE sessions SET failures = failures + 1 WHERE session_id = ?",
                        (row["session_id"],))
 
@@ -311,7 +344,7 @@ class Store:
                         rec = json.loads(line)
                     except json.JSONDecodeError:
                         continue
-                    row = {c: rec.get(c) for c in EVENT_COLUMNS}
+                    row = normalize_event({c: rec.get(c) for c in EVENT_COLUMNS})
                     if not row["trace_id"]:
                         continue
                     cur = db.execute(
@@ -330,7 +363,9 @@ class Store:
 
 
 def summarize_transcript(data: bytes):
-    """Extract token usage + models from a Claude Code transcript snapshot."""
+    """Extract token usage + models from a transcript snapshot. Understands
+    the Claude Code JSONL format; other sources currently contribute only a
+    line count (events still carry their model per record)."""
     totals = {"input_tokens": 0, "output_tokens": 0,
               "cache_read_tokens": 0, "cache_creation_tokens": 0}
     models = set()
@@ -981,21 +1016,21 @@ class Handler(BaseHTTPRequestHandler):
             totals = db.execute(
                 f"""SELECT COUNT(DISTINCT session_id) AS sessions,
                            COUNT(*) AS events,
-                           SUM(event = 'UserPromptSubmit') AS prompts,
-                           SUM(event = 'PostToolUse') AS tool_calls,
-                           SUM(event = 'PostToolUseFailure') AS failures,
+                           SUM(event = 'prompt.submit') AS prompts,
+                           SUM(event = 'tool.call') AS tool_calls,
+                           SUM(event = 'tool.fail') AS failures,
                            COUNT(DISTINCT project) AS projects,
                            COUNT(DISTINCT origin) AS origins
                     FROM events{where}""", params).fetchone()
             per_day = db.execute(
                 f"""SELECT substr(ts, 1, 10) AS day,
-                           SUM(event = 'UserPromptSubmit') AS prompts,
-                           SUM(event = 'PostToolUse') AS tool_calls
+                           SUM(event = 'prompt.submit') AS prompts,
+                           SUM(event = 'tool.call') AS tool_calls
                     FROM events{where} GROUP BY day ORDER BY day""", params).fetchall()
             top_tools = db.execute(
                 f"""SELECT tool_name AS tool, COUNT(*) AS n FROM events
                     {where + (' AND ' if where else ' WHERE ')}
-                    event = 'PostToolUse' AND tool_name IS NOT NULL
+                    event = 'tool.call' AND tool_name IS NOT NULL
                     GROUP BY tool_name ORDER BY n DESC LIMIT 12""", params).fetchall()
             # Token totals come from transcript snapshots (sessions table).
             swhere, sparams = [], []

@@ -431,16 +431,28 @@ async function viewSessions() {
   await loadSessions();
 }
 
+// Canonical, tool-agnostic vocabulary. Indexes built before v0.3 may still
+// hold the legacy Claude-shaped names — normalize when rendering.
+const LEGACY_EVENTS = {
+  SessionStart: "session.start", UserPromptSubmit: "prompt.submit",
+  PostToolUse: "tool.call", PostToolUseFailure: "tool.fail",
+  Stop: "turn.end", SubagentStart: "agent.start", SubagentStop: "agent.end",
+  PreCompact: "context.compact", SessionEnd: "session.end",
+};
+const canonEvent = (ev) => LEGACY_EVENTS[ev] || ev;
+
 const EVENT_GLYPHS = {
-  SessionStart: ["▶", "", "session start"],
-  UserPromptSubmit: ["❯", "prompt", "prompt"],
-  PostToolUse: ["⚙", "", ""],
-  PostToolUseFailure: ["✕", "fail", "tool failure"],
-  Stop: ["◀", "stop", "turn end"],
-  SubagentStart: ["◌", "agent", "subagent start"],
-  SubagentStop: ["◌", "agent", "subagent stop"],
-  PreCompact: ["≋", "", "context compaction"],
-  SessionEnd: ["■", "", "session end"],
+  "session.start": ["▶", "", "session start"],
+  "prompt.submit": ["❯", "prompt", "prompt"],
+  "tool.call": ["⚙", "", ""],
+  "tool.fail": ["✕", "fail", "tool failure"],
+  "model.turn": ["∴", "", "model turn"],
+  "turn.end": ["◀", "stop", "turn end"],
+  "agent.start": ["◌", "agent", "subagent start"],
+  "agent.end": ["◌", "agent", "subagent stop"],
+  "context.compact": ["≋", "", "context management"],
+  "session.end": ["■", "", "session end"],
+  "note": ["·", "", "note"],
 };
 
 async function viewSession(sid) {
@@ -486,13 +498,14 @@ async function viewSession(sid) {
   const tl = document.createElement("div");
   tl.className = "timeline";
   tl.innerHTML = data.events.map((e, i) => {
-    const [glyph, cls, tag] = EVENT_GLYPHS[e.event] || ["·", "", e.event];
+    const ev = canonEvent(e.event);
+    const [glyph, cls, tag] = EVENT_GLYPHS[ev] || ["·", "", ev];
     let body = "";
-    if (e.event === "UserPromptSubmit") {
+    if (ev === "prompt.submit") {
       body = `<div class="tl-card prompt"><div class="tl-tag">prompt${e.agent_type ? " · " + esc(e.agent_type) : ""}</div>
         <div class="tl-text">${esc(e.prompt || "")}</div></div>`;
-    } else if (e.event === "PostToolUse" || e.event === "PostToolUseFailure") {
-      const fail = e.event === "PostToolUseFailure";
+    } else if (ev === "tool.call" || ev === "tool.fail") {
+      const fail = ev === "tool.fail";
       body = `<div class="tl-card${fail ? " fail" : ""}">
         <div class="tl-tool" data-i="${i}">
           <span class="chev">›</span>
@@ -504,11 +517,12 @@ async function viewSession(sid) {
           ${e.tool_input ? `<span class="microlabel">input</span><pre>${esc(e.tool_input)}</pre>` : ""}
           ${e.tool_response ? `<span class="microlabel">response</span><pre>${esc(e.tool_response)}</pre>` : ""}
         </div></div>`;
-    } else if (e.event === "Stop" || e.event === "SubagentStop") {
+    } else if (ev === "turn.end" || ev === "agent.end" || ev === "model.turn" || ev === "note") {
+      const label = tag + (e.model ? " · " + esc(e.model) : "");
       body = e.last_assistant_message
-        ? `<div class="tl-card stop"><div class="tl-tag">${esc(tag)}${e.agent_type ? " · " + esc(e.agent_type) : ""}</div>
+        ? `<div class="tl-card stop"><div class="tl-tag">${label}${e.agent_type ? " · " + esc(e.agent_type) : ""}</div>
            <div class="tl-text">${esc(e.last_assistant_message)}</div></div>`
-        : `<div class="tl-tag" style="padding:8px 0">${esc(tag)}</div>`;
+        : `<div class="tl-tag" style="padding:8px 0">${label}${ev === "model.turn" && e.tool_name ? " · → " + esc(e.tool_name) : ""}</div>`;
     } else {
       body = `<div class="tl-tag" style="padding:8px 0">${esc(tag)}
         ${e.model ? `· ${esc(e.model)}` : ""}</div>`;
@@ -652,15 +666,20 @@ Execute no diretório raiz do projeto:
    python3 ~/.gaide-trace-installer/tools/backfill.py "$PWD/.gaide-trace"
 
 4. Confirme que .gaide-trace/config.json aponta para ${origin} e me informe o resultado.
-   A captura é local-first: os dados ficam no projeto e são enviados ao servidor com retry automático.`;
+   A captura é local-first: os dados ficam no projeto e são enviados ao servidor com retry automático.
+
+Nota: os passos acima capturam sessões do Claude Code (hooks). Para sessões do
+Antigravity IDE neste projeto, rode periodicamente (ou deixe em watch):
+   python3 ~/.gaide-trace-installer/tools/import_antigravity.py --workspace "$PWD"`;
 }
 
 function promptReveal(p) {
   return `<div class="prompt-reveal" data-name="${esc(p.name)}">
     <div class="card-head"><span class="card-title">Install prompt — ${esc(p.name)}</span>
       <button class="btn copy-prompt" data-name="${esc(p.name)}">Copy prompt</button></div>
-    <p class="helper-text">Paste this into Claude Code (or any coding agent) at the
-      project root. The embedded key is ingest-only.</p>
+    <p class="helper-text">Paste this into your coding agent (Claude Code,
+      Antigravity, Cursor, …) at the project root. The embedded key is
+      ingest-only.</p>
     <textarea class="prompt-text" rows="14" readonly>${esc(installPrompt(p))}</textarea>
   </div>`;
 }

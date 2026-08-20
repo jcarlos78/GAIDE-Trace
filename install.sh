@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
 # GAIDE-Trace connector — opt-in installation into any Claude Code project.
+# (Claude Code adapter only: it registers hooks in .claude/. For other tools
+# — e.g. the Antigravity IDE — see docs/ADAPTERS.md and
+# tools/import_antigravity.py, which need no per-project installation.)
 #
 # Usage:
 #   ./install.sh /path/to/target-project [--project] \
@@ -119,3 +122,4 @@ if [ -n "$SERVER" ]; then
   echo "Backfill existing local data: python3 $TRACE_ROOT/tools/backfill.py $TARGET/.gaide-trace"
 fi
 echo "Disable anytime: export GAIDE_TRACE_DISABLE=1, or run ./uninstall.sh $TARGET"
+echo "Antigravity IDE sessions of this project: python3 $TRACE_ROOT/tools/import_antigravity.py --workspace $TARGET"

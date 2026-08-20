@@ -20,9 +20,20 @@ from pathlib import Path
 
 import pandas as pd
 
+# v0.2 stores hold Claude-shaped event names; normalize on read so analyses
+# only ever see the canonical, tool-agnostic vocabulary (docs/ADAPTERS.md).
+LEGACY_EVENTS = {
+    "SessionStart": "session.start", "UserPromptSubmit": "prompt.submit",
+    "PostToolUse": "tool.call", "PostToolUseFailure": "tool.fail",
+    "Stop": "turn.end", "SubagentStart": "agent.start",
+    "SubagentStop": "agent.end", "PreCompact": "context.compact",
+    "SessionEnd": "session.end",
+}
+
 
 def load_events(trace_dir) -> pd.DataFrame:
-    """One row per hook event (prompt submitted, tool used, turn ended...)."""
+    """One row per captured event (prompt submitted, tool used, turn ended...),
+    in the canonical vocabulary regardless of store version or source tool."""
     rows = []
     for f in sorted(Path(trace_dir, "events").glob("*.jsonl")):
         for line in f.read_text(encoding="utf-8").splitlines():
@@ -30,6 +41,14 @@ def load_events(trace_dir) -> pd.DataFrame:
                 rows.append(json.loads(line))
     df = pd.DataFrame(rows)
     if not df.empty:
+        legacy = df["event"].isin(LEGACY_EVENTS)
+        if "native_event" not in df:
+            df["native_event"] = None
+        if "source" not in df:
+            df["source"] = None
+        df.loc[legacy, "native_event"] = df.loc[legacy, "native_event"].fillna(df.loc[legacy, "event"])
+        df.loc[legacy, "source"] = df.loc[legacy, "source"].fillna("claude-code")
+        df["event"] = df["event"].replace(LEGACY_EVENTS)
         df["ts"] = pd.to_datetime(df["ts"], format="ISO8601")
         df = df.sort_values("ts").reset_index(drop=True)
     return df
@@ -37,7 +56,8 @@ def load_events(trace_dir) -> pd.DataFrame:
 
 def load_transcripts(trace_dir) -> pd.DataFrame:
     """One row per transcript entry (user/assistant messages, tool calls),
-    with token usage where Claude Code recorded it."""
+    with token usage where recorded. Parses the Claude Code transcript
+    format; sources without transcripts contribute via events only."""
     rows = []
     for f in sorted(Path(trace_dir, "transcripts").glob("*.jsonl")):
         for line in f.read_text(encoding="utf-8").splitlines():
@@ -88,9 +108,15 @@ def summarize(trace_dir) -> str:
     else:
         lines.append(f"sessions: {ev['session_id'].nunique()}")
         lines.append(f"events:   {len(ev)}  ({ev['ts'].min()} → {ev['ts'].max()})")
-        lines.append(f"prompts submitted: {(ev['event'] == 'UserPromptSubmit').sum()}")
+        lines.append(f"prompts submitted: {(ev['event'] == 'prompt.submit').sum()}")
+        if ev["source"].notna().any():
+            src = ev["source"].value_counts()
+            lines.append("sources: " + ", ".join(f"{k}×{v}" for k, v in src.items()))
+        if "model" in ev and ev["model"].notna().any():
+            mod = ev["model"].value_counts().head(5)
+            lines.append("models: " + ", ".join(f"{k}×{v}" for k, v in mod.items()))
         if "tool_name" in ev:
-            top = ev.loc[ev["event"] == "PostToolUse", "tool_name"].value_counts().head(10)
+            top = ev.loc[ev["event"] == "tool.call", "tool_name"].value_counts().head(10)
             if not top.empty:
                 lines.append("top tools: " + ", ".join(f"{k}×{v}" for k, v in top.items()))
     if not tr.empty:

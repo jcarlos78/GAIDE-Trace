@@ -3,9 +3,17 @@
 **A research-grade interaction ledger for AI-assisted development.**
 
 GAIDE-Trace captures a complete, analyzable history of every interaction
-between a developer and an AI coding agent (Claude Code) in a project:
-prompts, model responses, tool calls, subagent activity, and full session
-transcripts — stored as plain JSONL you can version, query and mine.
+between a developer and an AI coding agent in a project: prompts, model
+responses, tool calls, subagent activity, and full session transcripts —
+stored as plain JSONL you can version, query and mine.
+
+It is **LLM- and IDE-agnostic by design**: every record uses one canonical,
+tool-neutral event vocabulary (with the source tool and model preserved per
+record), so sessions from different agents land in the same store, the same
+server, and the same analyses. Capture adapters exist for **Claude Code**
+(real-time, via hooks) and the **Antigravity IDE** (incremental importer of
+its local session databases); adding a tool means writing one adapter — see
+[`docs/ADAPTERS.md`](docs/ADAPTERS.md).
 
 For teams, an optional **zero-dependency server** centralizes every member's
 traces into one durable ledger with a web console (dashboard, session
@@ -14,8 +22,8 @@ timelines, exports, key management) — see
 
 It is a **standalone, opt-in companion** to [GAIDE](https://github.com/jcarlos78/GAIDE)
 (Governed AI Development Environment). You can connect it to a GAIDE project,
-to any other Claude Code project, or not at all — the choice belongs to each
-user, per project.
+to any other project, or not at all — the choice belongs to each user, per
+project.
 
 ## Why
 
@@ -27,30 +35,36 @@ AI-assisted software engineering).
 
 ## How it works
 
-GAIDE-Trace uses Claude Code's native **hooks** — the same deterministic
-mechanism GAIDE uses for enforcement ("instructions degrade, mechanisms
-don't"). One small Python script is registered for the relevant lifecycle
-events and appends a normalized record to a local store:
+Each supported tool has a small, self-contained **adapter** that translates
+that tool's native record of a session into the canonical event vocabulary
+(`session.start`, `prompt.submit`, `tool.call`, `tool.fail`, `model.turn`,
+`turn.end`, `agent.start/end`, `context.compact`, `session.end`) and appends
+it to the project's local store:
 
 ```
 your-project/
 └── .gaide-trace/
     ├── events/       # one JSONL per session: prompts, tool calls, turn ends
-    └── transcripts/  # full-fidelity Claude Code transcript snapshots
-                      # (messages, tool I/O, per-turn token usage)
+    └── transcripts/  # full-fidelity transcript snapshots, where the tool
+                      # provides one (messages, tool I/O, per-turn tokens)
 ```
 
-Captured events: `SessionStart`, `UserPromptSubmit`, `PostToolUse`,
-`PostToolUseFailure`, `Stop`, `SubagentStart`, `SubagentStop`, `PreCompact`,
-`SessionEnd`. On `Stop`/`SessionEnd` the live transcript is snapshotted into
-the store, so the raw record survives Claude Code's retention cleanup.
+| Tool | Adapter | Mechanism |
+|---|---|---|
+| Claude Code | `hooks/trace_hook.py` | native hooks — real-time, deterministic ("instructions degrade, mechanisms don't") |
+| Antigravity IDE | `tools/import_antigravity.py` | incremental importer of Antigravity's local conversation databases (it has no hook system) |
+| anything else | yours | one file; see [`docs/ADAPTERS.md`](docs/ADAPTERS.md) |
+
+Every record carries `source` (which adapter), `native_event` (the tool's own
+event name) and, when known, `model` — so cross-tool and cross-LLM comparisons
+are a `groupby`, not a data-cleaning project.
 
 Two layers, two purposes:
 
 | Layer | Source | Best for |
 |---|---|---|
-| `events/` | hooks (this project) | timeline analysis, tool-usage patterns, prompt taxonomy |
-| `transcripts/` | Claude Code transcript snapshot | full conversation reconstruction, token accounting per turn |
+| `events/` | adapters (this project) | timeline analysis, tool-usage patterns, prompt taxonomy |
+| `transcripts/` | the tool's own transcript, snapshotted | full conversation reconstruction, token accounting per turn |
 
 Optionally, enable Claude Code's native **OpenTelemetry** export for
 quantitative metrics (cost, latency, tokens per request) — see
@@ -58,12 +72,25 @@ quantitative metrics (cost, latency, tokens per request) — see
 
 ## Install (connect to a project)
 
+**Claude Code** (registers the hooks):
+
 ```bash
 git clone https://github.com/jcarlos78/GAIDE-Trace
 cd GAIDE-Trace
 ./install.sh /path/to/your-project          # personal opt-in (settings.local.json)
 ./install.sh /path/to/your-project --project # shared: every contributor traces
 ```
+
+**Antigravity IDE** (imports its local session databases into the same store):
+
+```bash
+python3 tools/import_antigravity.py --workspace /path/to/your-project
+python3 tools/import_antigravity.py --watch 60   # or keep it running
+```
+
+By default the importer only touches projects that already have a
+`.gaide-trace/` store (i.e. that opted in); `--create-store` widens that.
+Import is incremental and idempotent — re-running never duplicates records.
 
 Requirements: Python 3.9+ on PATH. No third-party dependencies for capture;
 `pandas` only for the analysis toolkit.
