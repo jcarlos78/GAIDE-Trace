@@ -7,6 +7,11 @@ between a developer and an AI coding agent (Claude Code) in a project:
 prompts, model responses, tool calls, subagent activity, and full session
 transcripts — stored as plain JSONL you can version, query and mine.
 
+For teams, an optional **zero-dependency server** centralizes every member's
+traces into one durable ledger with a web console (dashboard, session
+timelines, exports, key management) — see
+[Team server](#team-server-optional).
+
 It is a **standalone, opt-in companion** to [GAIDE](https://github.com/jcarlos78/GAIDE)
 (Governed AI Development Environment). You can connect it to a GAIDE project,
 to any other Claude Code project, or not at all — the choice belongs to each
@@ -69,6 +74,40 @@ Disconnect anytime (data is preserved):
 ./uninstall.sh /path/to/your-project
 # or temporarily: export GAIDE_TRACE_DISABLE=1
 ```
+
+## Team server (optional)
+
+For a team, run the central ledger server — Python stdlib only, nothing to
+install — and connect each project to it:
+
+```bash
+# on your server (VPS or container — see docs/SERVER.md for TLS & systemd):
+python3 server/gaide_trace_server.py serve
+# then sign in at http://<server>:8321/ with admin/admin
+# (a new password is required on first login)
+```
+
+Everything else is visual: create team accounts on the **Users** page,
+register a project on the **Projects** page, and click **install prompt** —
+the console generates a copy-paste prompt that any team member gives to
+Claude Code, which clones this repo and connects their project automatically.
+The manual equivalent still works:
+
+```bash
+./install.sh /path/to/your-project --server https://trace.example.com --token gtr_...
+python3 tools/backfill.py /path/to/your-project/.gaide-trace   # pre-existing history
+```
+
+Capture stays **local-first**: every event is written to the project's local
+store before any network I/O, then shipped through an offline-safe outbox
+(at-least-once, deduped server-side) — a down server can never lose data.
+The server keeps a raw JSONL archive as the source of truth plus a SQLite
+index, and serves a web console at `/` with a team dashboard, per-session
+timelines, transcript downloads, filtered JSONL/CSV exports, and API key
+management (roles: `agent` = ingest-only for hooks, `member`, `admin`).
+
+Deployment (container with automatic TLS, or bare VPS with systemd + Caddy),
+backups and the HTTP API are documented in [`docs/SERVER.md`](docs/SERVER.md).
 
 ## Analyze
 

@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GAIDE-Trace — Interaction Ledger</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' fill='%23161616'/%3E%3Ccircle cx='16' cy='16' r='7' fill='none' stroke='%238a3ffc' stroke-width='2.5'/%3E%3Ccircle cx='16' cy='16' r='2.5' fill='%23fa4d56'/%3E%3C/svg%3E">
+<!-- IBM Plex (Carbon Design System type). Falls back to the system stacks
+     in style.css when the console is used offline. -->
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=IBM+Plex+Sans:wght@300;400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<div id="login" class="login hidden">
+  <div class="login-card">
+    <div class="login-mark">
+      <span class="rec-dot"></span>
+      <span class="wordmark"><b>GAIDE</b>&nbsp;Trace</span>
+    </div>
+    <div class="login-sub">Interaction ledger · team console</div>
+
+    <div id="login-step-cred" class="login-step">
+      <label class="microlabel" for="login-user">Username</label>
+      <input id="login-user" spellcheck="false" autocomplete="username">
+      <label class="microlabel" for="login-pass">Password</label>
+      <input id="login-pass" type="password" autocomplete="current-password">
+      <button id="login-btn" class="btn btn-accent">Log in</button>
+    </div>
+
+    <div id="login-step-pw" class="login-step hidden">
+      <p class="login-notice">First sign-in: set a new password to continue.</p>
+      <label class="microlabel" for="pw-current">Current password</label>
+      <input id="pw-current" type="password" autocomplete="current-password">
+      <label class="microlabel" for="pw-new">New password (min 8 chars)</label>
+      <input id="pw-new" type="password" autocomplete="new-password">
+      <label class="microlabel" for="pw-confirm">Confirm new password</label>
+      <input id="pw-confirm" type="password" autocomplete="new-password">
+      <button id="pw-btn" class="btn btn-accent">Set password</button>
+    </div>
+
+    <div id="login-error" class="login-error"></div>
+    <div class="login-hint">First access: <code>admin</code> / <code>admin</code>
+      (a new password is required immediately). Accounts are managed in the
+      console by an admin.</div>
+  </div>
+</div>
+
+<div id="shell" class="shell hidden">
+  <header class="topbar">
+    <div class="topbar-left">
+      <span class="rec-dot" title="ledger is receiving"></span>
+      <span class="wordmark"><b>GAIDE</b>&nbsp;Trace</span>
+      <span class="topbar-sub">Interaction ledger</span>
+    </div>
+    <nav class="nav" id="nav">
+      <a href="#/overview" data-view="overview">Overview</a>
+      <a href="#/sessions" data-view="sessions">Sessions</a>
+      <a href="#/projects" data-view="projects">Projects</a>
+      <a href="#/export" data-view="export">Export</a>
+      <a href="#/users" data-view="users" id="nav-users" class="hidden">Users</a>
+      <a href="#/keys" data-view="keys" id="nav-keys" class="hidden">API keys</a>
+    </nav>
+    <div class="topbar-right">
+      <span id="last-signal" class="last-signal"></span>
+      <span id="who" class="who"></span>
+      <button id="logout" class="btn btn-ghost">disconnect</button>
+    </div>
+  </header>
+  <main id="main"></main>
+  <footer class="footer">
+    <span>GAIDE-Trace server console</span>
+    <span id="server-version"></span>
+    <span>plain JSONL is the source of truth — everything here is exportable</span>
+  </footer>
+</div>
+
+<div id="tooltip" class="tooltip hidden"></div>
+
+<script src="app.js"></script>
+</body>
+</html>

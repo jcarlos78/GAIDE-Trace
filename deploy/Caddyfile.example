@@ -1,0 +1,8 @@
+# TLS termination for a VPS install (systemd unit binds to 127.0.0.1:8321).
+# Replace the domain, then:  caddy run --config Caddyfile
+# Caddy provisions and renews the Let's Encrypt certificate automatically.
+
+trace.example.com {
+	reverse_proxy 127.0.0.1:8321
+	encode gzip
+}

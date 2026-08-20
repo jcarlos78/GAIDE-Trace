@@ -35,3 +35,7 @@ if hook.is_file():
 PY
 
 echo "GAIDE-Trace disconnected. Data in $TARGET/.gaide-trace/ was preserved."
+if [ -f "$TARGET/.gaide-trace/config.json" ]; then
+  echo "Note: the team-server connection ($TARGET/.gaide-trace/config.json) was kept;"
+  echo "delete it (and revoke the key on the server) to sever the link completely."
+fi

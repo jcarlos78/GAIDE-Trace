@@ -1,0 +1,44 @@
+# GAIDE-Trace server — container deployment with TLS.
+#
+#   docker compose -f deploy/docker-compose.yml up -d
+#   docker compose -f deploy/docker-compose.yml logs server   # first-run admin key
+#
+# With TRACE_DOMAIN set (and DNS pointing at this host), Caddy terminates TLS
+# with an automatic Let's Encrypt certificate:
+#   TRACE_DOMAIN=trace.example.com docker compose -f deploy/docker-compose.yml \
+#     --profile tls up -d
+# Without the tls profile, the server listens plain on localhost:8321 —
+# fine for a LAN or behind your own reverse proxy.
+
+services:
+  server:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: gaide-trace-server
+    restart: unless-stopped
+    volumes:
+      - trace-data:/data
+    ports:
+      - "127.0.0.1:8321:8321"
+
+  caddy:
+    image: caddy:2-alpine
+    profiles: ["tls"]
+    restart: unless-stopped
+    depends_on:
+      - server
+    environment:
+      TRACE_DOMAIN: ${TRACE_DOMAIN:?set TRACE_DOMAIN=trace.example.com}
+    command: caddy reverse-proxy --from "https://{$TRACE_DOMAIN}" --to server:8321
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - caddy-data:/data
+      - caddy-config:/config
+
+volumes:
+  trace-data:
+  caddy-data:
+  caddy-config:

@@ -14,6 +14,7 @@
     },
     "session_id": { "type": "string" },
     "prompt_id": { "type": "string", "description": "Groups all events of one user turn" },
+    "project": { "type": "string", "description": "Project name (GAIDE_TRACE_PROJECT, store config, or basename of cwd)" },
     "cwd": { "type": "string" },
     "permission_mode": { "type": "string" },
     "model": { "type": "string" },
@@ -25,6 +26,8 @@
     "tool_response": { "type": "string", "description": "JSON-serialized, redacted, truncated" },
     "prompt": { "type": "string", "description": "User prompt text (UserPromptSubmit)" },
     "last_assistant_message": { "type": "string", "description": "Final assistant text of the turn (Stop/SubagentStop)" },
-    "transcript_path": { "type": "string", "description": "Path of the live Claude Code transcript at capture time" }
+    "transcript_path": { "type": "string", "description": "Path of the live Claude Code transcript at capture time" },
+    "origin": { "type": "string", "description": "Server-side only: name of the API key that shipped the record" },
+    "received_at": { "type": "string", "format": "date-time", "description": "Server-side only: UTC arrival time" }
   }
 }

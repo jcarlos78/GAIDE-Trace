@@ -1,0 +1,38 @@
+# GAIDE-Trace server — systemd unit for a bare VPS (no container runtime).
+#
+# Install (as root):
+#   useradd --system --create-home --home-dir /var/lib/gaide-trace gaide-trace
+#   git clone https://github.com/jcarlos78/GAIDE-Trace /opt/gaide-trace
+#   cp /opt/gaide-trace/deploy/gaide-trace-server.service /etc/systemd/system/
+#   systemctl daemon-reload && systemctl enable --now gaide-trace-server
+#   journalctl -u gaide-trace-server | grep gtr_     # first-run admin key
+#
+# The server binds to localhost only; put Caddy or nginx in front for TLS
+# (see docs/SERVER.md).
+
+[Unit]
+Description=GAIDE-Trace team server (interaction ledger)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=gaide-trace
+Group=gaide-trace
+ExecStart=/usr/bin/python3 /opt/gaide-trace/server/gaide_trace_server.py serve \
+  --host 127.0.0.1 --port 8321 --data /var/lib/gaide-trace/data
+Restart=on-failure
+RestartSec=3
+
+# Hardening: the process only ever needs its data directory.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/gaide-trace
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target

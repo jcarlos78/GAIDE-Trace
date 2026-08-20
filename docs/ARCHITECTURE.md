@@ -96,6 +96,51 @@ Typical research queries this supports directly:
 - Governance events: how often GAIDE hooks blocked actions (visible as
   failed/denied tool patterns).
 
+## Team server (optional centralization layer)
+
+`server/gaide_trace_server.py` extends the same design to a team: every
+member's hooks ship each record to one central ledger, without weakening any
+local guarantee.
+
+### D6 — Local-first shipping with an outbox
+
+The local store is written **before** any network I/O, unconditionally; the
+server is an additional destination, never a dependency (D4 still holds: a
+down server costs nothing). Each record is then queued as one file in
+`.gaide-trace/outbox/` and shipped in batches; failures leave the queue
+intact and later hook fires retry. Delivery is at-least-once and the server
+dedupes by `trace_id`, so retries are safe by construction. File-per-record
+spooling makes concurrent hook processes safe without locks.
+`tools/backfill.py` replays a whole local store through the same idempotent
+API — adopting the server late, or recovering a server from developer
+machines, is the same one command.
+
+### D7 — Server storage mirrors the two-layer model; JSONL stays the truth
+
+The server persists three things: a raw append-only JSONL archive (one file
+per session — the source of truth), the transcript snapshots (each upload
+supersedes the last, same semantics as local), and a SQLite (WAL) index for
+queries and aggregates. The index is derived data: `rebuild-index`
+reconstructs it from the archive, and file-level backups of the data
+directory are sufficient and consistent.
+
+### D8 — Zero dependencies on the server too
+
+The server is Python stdlib only (`http.server`, `sqlite3`), one process,
+one data directory. Rationale: a research tool should be auditable and
+deployable anywhere Python exists — a VPS with systemd, a container, a lab
+machine — with no supply chain to review. TLS is delegated to a standard
+reverse proxy (Caddy/nginx). Auth is bearer keys (SHA-256 hashes at rest)
+with three roles; hooks get ingest-only `agent` keys, so a leaked hook key
+can add data but never read it.
+
+The web console (`server/webui/`) serves the management needs — team
+dashboard, session timeline reconstruction, filtered JSONL/CSV export, key
+management — while `GET /api/v1/export` keeps the data pipeline scriptable
+(same schema as the local store, plus `origin` and `received_at`).
+
+See `docs/SERVER.md` for deployment (VPS / container), backups and the API.
+
 ## Quantitative telemetry (optional third layer)
 
 Claude Code exports OpenTelemetry metrics natively
@@ -120,9 +165,10 @@ The event schema is tool-agnostic on purpose (`event`, `session_id`,
 
 ## Roadmap
 
-- v0.1 (this repo): hooks capture + transcript snapshots + pandas loaders.
-- v0.2: session report generator (Markdown/HTML per session), anonymization
-  pass for publishable datasets.
-- v0.3: adapters for other tools via gateway logs; optional SQLite index
-  built from the JSONL (JSONL stays the source of truth).
+- v0.1: hooks capture + transcript snapshots + pandas loaders.
+- v0.2 (this repo): team server — central ledger with outbox shipping,
+  web console, exports, key management (D6–D8); SQLite index built from the
+  JSONL (JSONL stays the source of truth).
+- v0.3: session report generator (Markdown/HTML per session), anonymization
+  pass for publishable datasets; adapters for other tools via gateway logs.
 - Possible packaging as a Claude Code **plugin** for one-command install.
