@@ -1,3 +1,41 @@
-__pycache__/
-data/
+# macOS
 .DS_Store
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Local Claude Code overrides (project-level settings stays in git; user
+# overrides do not — this is where personal opt-in tracing registers itself)
+.claude/settings.local.json
+.claude/.credentials.json
+
+# Local working memory — not repo content
+PROGRESS.md
+
+# Environment / secrets
+.env
+.env.local
+.env.*.local
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Server data: JSONL archive, SQLite index, keys — never versioned
+data/
+
+# GAIDE-Trace local store (connect to a data repo if you want it versioned)
+.gaide-trace/
+
+# Self-tracing: ./install.sh . drops a copy of the capture adapter here for the
+# registered hook command. The source of truth is hooks/trace_hook.py — never
+# commit (or edit) the copy.
+.claude/hooks/trace_hook.py

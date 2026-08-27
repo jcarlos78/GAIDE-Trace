@@ -1,0 +1,11 @@
+{
+  "$schema": "https://modelcontextprotocol.io/schema/mcp.json",
+  "_comment": "Canonical MCP reference for this repository (see docs/mcp-setup.md for connecting them in each tool). GAIDE-Trace integrates with no external system by design — the capture path is stdlib-only and the store is local files — so the only server here is the browser automation the verifier skill needs to exercise the team server's web console end-to-end. Servers named with a leading underscore are disabled.",
+  "mcpServers": {
+    "playwright": {
+      "_doc": "Browser automation for empirical verification (see agents/skills/verifier.md): the agent drives the server console at http://127.0.0.1:8321/ as a user would — login, dashboard, session timeline, exports — before any criterion reaches 'verified'.",
+      "command": "npx",
+      "args": ["-y", "@playwright/mcp@latest"]
+    }
+  }
+}

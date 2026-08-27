@@ -25,6 +25,9 @@ It is a **standalone, opt-in companion** to [GAIDE](https://github.com/jcarlos78
 to any other project, or not at all — the choice belongs to each user, per
 project.
 
+GAIDE-Trace is also **developed under GAIDE itself** — see
+[How this project is developed](#how-this-project-is-developed).
+
 ## Why
 
 Governance needs evidence. GAIDE enforces *how* AI-assisted development should
@@ -168,6 +171,32 @@ The event schema is documented in `schema/event.schema.json`.
 See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full design:
 data model, why hooks + transcript snapshots (and not a proxy), how to extend
 capture to other AI tools via an LLM gateway, and the analysis roadmap.
+
+## How this project is developed
+
+GAIDE-Trace records governed AI-assisted development, so it is developed that
+way itself: this repository runs the [GAIDE](https://github.com/jcarlos78/GAIDE)
+harness ([ADR 0001](docs/adr/0001-adopt-gaide-harness.md)).
+
+- [`AGENTS.md`](AGENTS.md) — canonical briefing for any coding agent, including
+  the project invariants that are not up for negotiation (capture never breaks
+  the session, redaction at capture time, local-first shipping, JSONL as the
+  truth, standard library only on the capture and server path).
+- [`specs/`](specs/) — constitution and spec-driven flow. Behavior is specified
+  before it is coded; pre-v0.3 code carries that debt openly
+  ([why nothing is back-filled](specs/README.md)).
+- [`scripts/`](scripts/) — enforcement checks that run as Claude Code hooks, in
+  pre-commit, and in CI: secret patterns, per-file syntax, SAST/dependency
+  scans, and `check-stdlib-only.sh`, which mechanically rejects a third-party
+  import on the capture or server path.
+- [`./init.sh`](init.sh) — session bring-up: compile every module, check the
+  invariants and the event schema, run the tests, and start a throwaway server
+  to prove `/healthz` answers.
+
+Contributing: run `./init.sh` first, read `AGENTS.md`, and keep the generated
+tool bindings in sync with `scripts/sync-adapters.sh` (CI fails on drift).
+Adopting the harness does **not** make GAIDE a dependency of GAIDE-Trace —
+nothing shipped to a traced project references it.
 
 ## License
 
