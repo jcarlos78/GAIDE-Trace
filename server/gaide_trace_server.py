@@ -64,7 +64,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-VERSION = "0.3.0"
+VERSION = "0.3.1"
 
 MAX_EVENTS_BODY = 32 * 1024 * 1024        # 32 MB per events batch
 MAX_TRANSCRIPT_BODY = 256 * 1024 * 1024   # 256 MB per transcript snapshot
