@@ -19,8 +19,10 @@ Wants=network-online.target
 Type=simple
 User=gaide-trace
 Group=gaide-trace
-ExecStart=/usr/bin/python3 /opt/gaide-trace/server/gaide_trace_server.py serve \
-  --host 127.0.0.1 --port 8321 --data /var/lib/gaide-trace/data
+# --data is a top-level flag, so it has to precede the subcommand: argparse
+# rejects `serve --data ...` outright.
+ExecStart=/usr/bin/python3 /opt/gaide-trace/server/gaide_trace_server.py \
+  --data /var/lib/gaide-trace/data serve --host 127.0.0.1 --port 8321
 Restart=on-failure
 RestartSec=3
 
