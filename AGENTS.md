@@ -20,7 +20,7 @@
 - **Third-party dependencies:** `pandas`, and only in `analysis/` (the analysis toolkit is explicitly opt-in).
 - **Framework:** none. The server is `http.server` + `sqlite3`; the web console is vanilla HTML/CSS/JS with no build step and no CDN.
 - **Storage:** JSONL is the source of truth (local store and server archive); SQLite is a rebuildable index (`rebuild-index`), never the truth.
-- **Deployment:** the server runs anywhere Python does — container image in `deploy/` (Docker Compose + Caddy for TLS) or bare VPS with systemd + Caddy. See `docs/SERVER.md`.
+- **Deployment:** the server runs anywhere Python does — container image in `deploy/` (Docker Compose + Caddy for TLS), bare VPS with systemd + Caddy, or the Terraform reference deployment for AWS in `deploy/aws/`. See `docs/SERVER.md`.
 
 ## Relevant folder structure
 
@@ -43,6 +43,7 @@
 ├── analysis/               pandas loaders for the captured store
 ├── install.sh / uninstall.sh  Connect (or disconnect) a target project
 ├── config/, deploy/        OTEL example env, container/systemd/Caddy deployment
+│   └── aws/                Terraform reference deployment (EC2 + EBS + Caddy + S3)
 └── docs/                   ARCHITECTURE.md (design decisions D1–D8), ADAPTERS.md, SERVER.md
 ```
 

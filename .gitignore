@@ -39,3 +39,13 @@ data/
 # registered hook command. The source of truth is hooks/trace_hook.py — never
 # commit (or edit) the copy.
 .claude/hooks/trace_hook.py
+
+# Terraform (deploy/aws): state can hold resource attributes and is never
+# versioned here; the provider lock file is, and terraform.tfvars names your
+# infrastructure. The .lock.hcl is deliberately NOT ignored.
+deploy/aws/.terraform/
+deploy/aws/*.tfstate
+deploy/aws/*.tfstate.*
+deploy/aws/crash.log
+deploy/aws/terraform.tfvars
+deploy/aws/*.auto.tfvars

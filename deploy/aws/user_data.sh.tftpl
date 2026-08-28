@@ -1,0 +1,130 @@
+#!/usr/bin/env bash
+# First-boot bootstrap for the GAIDE-Trace server on Ubuntu 24.04 (arm64).
+#
+# Rendered by Terraform, which owns brace interpolation in this file. A shell
+# variable that needs braces is therefore doubled: $${name}.
+#
+# Everything here is idempotent: user_data_replace_on_change means a changed
+# template rebuilds the instance, and the data volume it re-attaches to already
+# holds a formatted filesystem and a populated archive.
+set -euxo pipefail
+exec >>/var/log/gaide-trace-bootstrap.log 2>&1
+
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -y
+apt-get install -y git curl ca-certificates debian-keyring debian-archive-keyring apt-transport-https
+
+# --- Data volume -------------------------------------------------------------
+# Address the volume by serial rather than /dev/sdf: Nitro instances rename
+# every attachment to an arbitrary /dev/nvmeXn1.
+DEVICE=/dev/disk/by-id/nvme-Amazon_Elastic_Block_Store_${data_volume_serial}
+
+for _ in $(seq 1 60); do
+  [ -e "$${DEVICE}" ] && break
+  sleep 3
+done
+[ -e "$${DEVICE}" ]
+
+# A raw device makes blkid exit non-zero; that is the signal to format, not a
+# failure, and the guard is what keeps a rebuild from erasing the archive.
+if ! blkid "$${DEVICE}" >/dev/null 2>&1; then
+  mkfs.ext4 -L gaide-trace "$${DEVICE}"
+fi
+
+mkdir -p /var/lib/gaide-trace
+VOLUME_UUID=$(blkid -s UUID -o value "$${DEVICE}")
+grep -q "$${VOLUME_UUID}" /etc/fstab \
+  || echo "UUID=$${VOLUME_UUID} /var/lib/gaide-trace ext4 defaults,nofail 0 2" >>/etc/fstab
+mount -a
+
+# --- Service account ---------------------------------------------------------
+id gaide-trace >/dev/null 2>&1 \
+  || useradd --system --home-dir /var/lib/gaide-trace --shell /usr/sbin/nologin gaide-trace
+
+mkdir -p /var/lib/gaide-trace/data
+chown -R gaide-trace:gaide-trace /var/lib/gaide-trace
+# The archive and transcripts are raw session data (D5): nothing outside the
+# service account has any business reading them.
+chmod 750 /var/lib/gaide-trace
+
+# --- Server ------------------------------------------------------------------
+if [ -d /opt/gaide-trace/.git ]; then
+  git -C /opt/gaide-trace fetch --depth 1 origin "${repo_ref}"
+  git -C /opt/gaide-trace checkout -f FETCH_HEAD
+else
+  git clone --depth 1 --branch "${repo_ref}" "${repo_url}" /opt/gaide-trace
+fi
+
+install -m 644 /opt/gaide-trace/deploy/gaide-trace-server.service \
+  /etc/systemd/system/gaide-trace-server.service
+systemctl daemon-reload
+systemctl enable --now gaide-trace-server
+
+# --- TLS ---------------------------------------------------------------------
+curl -fsSL https://dl.cloudsmith.io/public/caddy/stable/gpg.key \
+  | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+curl -fsSL https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt \
+  >/etc/apt/sources.list.d/caddy-stable.list
+apt-get update -y
+apt-get install -y caddy
+
+cat >/etc/caddy/Caddyfile <<'CADDYFILE'
+${domain} {
+	reverse_proxy 127.0.0.1:8321
+	encode gzip
+}
+CADDYFILE
+
+systemctl enable caddy
+systemctl restart caddy
+
+%{ if backup_enabled ~}
+# --- Backups -----------------------------------------------------------------
+apt-get install -y unzip
+curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-aarch64.zip" -o /tmp/awscliv2.zip
+unzip -q -o /tmp/awscliv2.zip -d /tmp
+/tmp/aws/install --update
+rm -rf /tmp/aws /tmp/awscliv2.zip
+
+cat >/usr/local/bin/gaide-trace-backup <<'BACKUP'
+#!/usr/bin/env bash
+set -euo pipefail
+# trace.db is excluded on purpose: it is a derived index that rebuild-index
+# reconstructs from the JSONL archive (D7), and copying a live SQLite file
+# would ship a torn snapshot that backs up nothing the archive lacks.
+# No --delete either — the archive is append-only, so a local deletion is a
+# bug or an intrusion, never something to replicate off-box.
+exec /usr/local/bin/aws s3 sync \
+  /var/lib/gaide-trace/data/ "s3://${backup_bucket}/data/" \
+  --region "${aws_region}" \
+  --exclude 'trace.db' --exclude 'trace.db-*'
+BACKUP
+chmod 755 /usr/local/bin/gaide-trace-backup
+
+cat >/etc/systemd/system/gaide-trace-backup.service <<'UNIT'
+[Unit]
+Description=Sync the GAIDE-Trace archive to S3
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/gaide-trace-backup
+UNIT
+
+cat >/etc/systemd/system/gaide-trace-backup.timer <<'UNIT'
+[Unit]
+Description=Nightly GAIDE-Trace archive backup
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=1h
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+UNIT
+
+systemctl daemon-reload
+systemctl enable --now gaide-trace-backup.timer
+%{ endif ~}
+
+touch /var/lib/gaide-trace/.bootstrap-complete

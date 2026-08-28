@@ -159,7 +159,33 @@ Kubernetes or any other orchestrator: run the same image with `/data` on a
 persistent volume and one replica (SQLite is single-writer by design at this
 scale).
 
-## 5. Backups
+## 5. Deploy on AWS (Terraform)
+
+`deploy/aws/` provisions the §3 layout on AWS as code: one Graviton EC2
+instance, the archive on a dedicated EBS volume that instance rebuilds never
+touch, Caddy for TLS, and a nightly sync of the JSONL truth layer to a
+versioned S3 bucket.
+
+```bash
+cd deploy/aws
+cp terraform.tfvars.example terraform.tfvars   # set domain and region
+terraform init && terraform apply
+```
+
+Point your A record at the `public_ip` output (or set `route53_zone_id` and let
+Terraform own the record), then sign in at `https://<domain>/` as `admin` /
+`admin` — and change that password immediately, because the console is public
+the moment DNS resolves.
+
+Shell access is through SSM Session Manager, so no port 22 is open by default.
+Roughly US$ 20/month on-demand; see `deploy/aws/README.md` for the cost
+breakdown, upgrades, restore procedure and teardown.
+
+Serverless is deliberately not offered: the truth layer is an append-only
+directory plus a single-writer SQLite index (D6/D7), which needs one process
+with one persistent local disk.
+
+## 6. Backups
 
 The entire state is one directory (`data/`, or the `trace-data` volume):
 
@@ -178,7 +204,7 @@ rsync -a /var/lib/gaide-trace/data/ backup-host:/backups/gaide-trace/
 If `trace.db` is ever lost or corrupted, `rebuild-index` reconstructs it from
 the JSONL archive.
 
-## 6. API (for your own tooling)
+## 7. API (for your own tooling)
 
 **Upgrading from v0.2:** event names are now the canonical tool-agnostic
 vocabulary (see `docs/ADAPTERS.md`); legacy Claude-shaped names are
@@ -212,7 +238,7 @@ The export format is the same schema as the local store
 (`schema/event.schema.json`) plus `origin` (key name) and `received_at` —
 `analysis/load_trace.py` loads server exports unchanged.
 
-## 7. Security notes
+## 8. Security notes
 
 - **Always front with TLS** for anything beyond localhost — passwords and
   tokens travel as bearer credentials.
