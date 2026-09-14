@@ -121,7 +121,7 @@ MCP servers are declared in `.mcp.json` (canonical reference). See `docs/mcp-set
 - **Current autonomy mode:** HIC (every code change requires explicit human approval before commit).
 - **Change size:** prefer small, atomic changes. No sweeping refactors without an ADR.
 - **Comments:** only when the *why* is not obvious from the code.
-- **Tests:** changing code that affects behavior without changing/adding tests is forbidden. The suite lives in `tests/` and runs with `pytest` (stdlib `unittest` style, no third-party fixtures).
+- **Tests:** changing code that affects behavior without changing/adding tests is forbidden. The suite lives in `tests/` (stdlib `unittest` style, no third-party fixtures) and runs with `pytest -q` or `python3 -m unittest discover -s tests`; `./init.sh` uses whichever is available.
 - **Verification:** for anything touching the web console or the ingest path, "tests pass" is not "it works" — use the `verifier` skill against a locally running server before a criterion reaches `verified`.
 - **Logging:** the capture path never logs to stdout (D4). Server-side operational errors fail visibly (Principle 8) via the server's own logging.
 

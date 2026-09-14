@@ -35,8 +35,15 @@ python3 -m json.tool schema/event.schema.json > /dev/null
 echo "event schema OK"
 
 # 5. Test suite — red at session start means broken inherited state.
-if command -v pytest >/dev/null 2>&1 && [ -d tests ]; then
-  pytest -q || [ $? -eq 5 ]  # exit 5 = no tests collected yet
+# The suite is unittest-style precisely so it runs without pytest; skipping it
+# when pytest is absent would let bring-up report OK with no tests run.
+if [ -d tests ]; then
+  if command -v pytest >/dev/null 2>&1; then
+    pytest -q || [ $? -eq 5 ]  # exit 5 = no tests collected yet
+  else
+    python3 -m unittest discover -s tests -q || [ $? -eq 5 ]  # 5 = none collected (3.12+)
+  fi
+  echo "tests OK"
 fi
 
 # 6. Health check — start the server on a throwaway data dir and hit it as a
