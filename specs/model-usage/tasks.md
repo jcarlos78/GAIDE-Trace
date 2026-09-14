@@ -412,7 +412,7 @@ caveats, price management); D7 paragraph on derived-index versioning.
 
 ## Task 16 — Verification, reviews, commit
 
-**Status:** in-progress
+**Status:** done
 
 **Files:** — (seed script kept in scratchpad, not committed)
 
@@ -429,7 +429,7 @@ commit (HIC).
   blockers fixed; their second-round blockers (token-sum overflow, docs claim,
   AC33 parse paths) are fixed with tests and exercised in verifier run 4, but
   the reviewers were not re-run on that last round
-- [ ] Maintainer approved commit 2
+- [x] Maintainer approved commit 2 (`debbe45`; released in v0.4.0)
 
 **Notes:** verifier run 1 failed AC3, AC14, AC30 and found a pre-existing
 session-time bug (fixed in its own commit). Run 2 passed on desktop and found a
