@@ -1,0 +1,86 @@
+"""Synthesized fixtures for the test suite.
+
+Every byte here is hand-written. Real stores carry prompts, file contents and
+third-party personal data, so nothing is ever copied from `.gaide-trace/` or a
+server archive (see tests/README.md).
+
+The transcript builders mimic the Claude Code JSONL shape the server parses:
+one line per content block, each repeating the message's `id`, `model` and
+`usage` — which is what made per-line summing double-count tokens.
+"""
+
+import importlib.util
+import json
+import uuid
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+
+
+def load_server():
+    """Import server/gaide_trace_server.py as a module (it is a script, not a
+    package — deployments copy the single file)."""
+    spec = importlib.util.spec_from_file_location(
+        "gaide_trace_server", REPO / "server" / "gaide_trace_server.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def usage(input_tokens=0, output_tokens=0, cache_read=0, cache_write=0,
+          cache_5m=None, cache_1h=None, speed="standard"):
+    u = {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "cache_read_input_tokens": cache_read,
+        "cache_creation_input_tokens": cache_write,
+        "service_tier": "standard",
+    }
+    if cache_5m is not None or cache_1h is not None:
+        u["cache_creation"] = {"ephemeral_5m_input_tokens": cache_5m or 0,
+                               "ephemeral_1h_input_tokens": cache_1h or 0}
+    if speed is not None:
+        u["speed"] = speed
+    return u
+
+
+def assistant_lines(model, u, ts, msg_id="auto", blocks=1, session_id="s"):
+    """One assistant message written as `blocks` transcript lines. Pass
+    msg_id=None for a message without an id."""
+    if msg_id == "auto":
+        msg_id = "msg_" + uuid.uuid4().hex[:20]
+    lines = []
+    for i in range(blocks):
+        message = {"model": model, "role": "assistant", "type": "message",
+                   "content": [{"type": "text", "text": f"block {i}"}],
+                   "usage": u}
+        if msg_id is not None:
+            message["id"] = msg_id
+        lines.append({"type": "assistant", "uuid": uuid.uuid4().hex,
+                      "sessionId": session_id, "timestamp": ts,
+                      "message": message})
+    return lines
+
+
+def user_line(text, ts, session_id="s"):
+    return {"type": "user", "uuid": uuid.uuid4().hex, "sessionId": session_id,
+            "timestamp": ts, "message": {"role": "user", "content": text}}
+
+
+def transcript(*groups, malformed=False):
+    """Join lines (or lists of lines) into transcript bytes."""
+    out = []
+    for g in groups:
+        out.extend(g if isinstance(g, list) else [g])
+    text = "\n".join(json.dumps(line) for line in out) + "\n"
+    if malformed:
+        text += "{not json\n"
+    return text.encode("utf-8")
+
+
+def event(session_id, event_name, ts, **fields):
+    """A canonical event record as an adapter would ship it."""
+    rec = {"trace_id": uuid.uuid4().hex[:12], "ts": ts, "event": event_name,
+           "session_id": session_id, "source": fields.pop("source", "claude-code")}
+    rec.update(fields)
+    return rec

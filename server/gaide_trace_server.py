@@ -66,6 +66,13 @@ from urllib.parse import parse_qs, urlparse
 
 VERSION = "0.3.1"
 
+# Bump whenever the rules that derive index data from stored transcripts
+# change: `serve` re-derives existing data on start (see
+# Store.rederive_if_stale), so an upgrade needs no manual rebuild-index.
+#   1 — transcript usage counted once per message, placeholder models dropped
+DERIVED_VERSION = 1
+PROGRESS_EVERY_SECONDS = 5
+
 MAX_EVENTS_BODY = 32 * 1024 * 1024        # 32 MB per events batch
 MAX_TRANSCRIPT_BODY = 256 * 1024 * 1024   # 256 MB per transcript snapshot
 
@@ -212,6 +219,10 @@ class Store:
           transcript_updated_at TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_sessions_last ON sessions(last_ts);
+        CREATE TABLE IF NOT EXISTS meta (
+          key TEXT PRIMARY KEY,
+          value TEXT
+        );
         """)
         # v0.2 -> v0.3 migration: add columns if the table predates them.
         cols = {r[1] for r in db.execute("PRAGMA table_info(events)")}
@@ -300,7 +311,19 @@ class Store:
         tmp = dst.with_suffix(".tmp")
         tmp.write_bytes(data)
         tmp.replace(dst)
-        stats = summarize_transcript(data)
+        return self.index_transcript(session_id, data, project, origin, utcnow())
+
+    def index_transcript(self, session_id: str, source, project, origin, updated_at):
+        """Derive the session's transcript accounting from `source` (the
+        uploaded bytes, or the stored snapshot's Path) without touching any
+        file — re-derivation must leave stored snapshots byte-identical."""
+        if isinstance(source, Path):
+            size = source.stat().st_size
+            with source.open("rb") as fh:
+                stats = summarize_transcript(fh)
+        else:
+            size = len(source)
+            stats = summarize_transcript(source)
         with self.connect() as db:
             db.execute(
                 """INSERT INTO sessions (session_id, project, origin) VALUES (?,?,?)
@@ -316,13 +339,13 @@ class Store:
                      cache_read_tokens = ?, cache_creation_tokens = ?,
                      models = ?
                    WHERE session_id = ?""",
-                (len(data), stats["lines"], utcnow(),
+                (size, stats["lines"], updated_at,
                  stats["input_tokens"], stats["output_tokens"],
                  stats["cache_read_tokens"], stats["cache_creation_tokens"],
                  stats["models"], session_id),
             )
             db.commit()
-        return {"bytes": len(data), "lines": stats["lines"]}
+        return {"bytes": size, "lines": stats["lines"]}
 
     def transcript_path(self, session_id: str):
         p = self.transcripts_dir / f"{session_id}.jsonl"
@@ -356,21 +379,87 @@ class Store:
                         self._bump_session(db, row)
                         n += 1
             db.commit()
-        for f in sorted(self.transcripts_dir.glob("*.jsonl")):
-            data = f.read_bytes()
-            self.store_transcript(f.stem, data, None, None)
+        self._reindex_transcripts()
+        self._set_derived_version(DERIVED_VERSION)
         return n
 
+    # ---- derived-data versioning ----
 
-def summarize_transcript(data: bytes):
-    """Extract token usage + models from a transcript snapshot. Understands
-    the Claude Code JSONL format; other sources currently contribute only a
-    line count (events still carry their model per record)."""
-    totals = {"input_tokens": 0, "output_tokens": 0,
-              "cache_read_tokens": 0, "cache_creation_tokens": 0}
-    models = set()
+    def _reindex_transcripts(self, progress=None):
+        files = sorted(self.transcripts_dir.glob("*.jsonl"))
+        last_report = time.monotonic()
+        for done, f in enumerate(files, 1):
+            # The file's mtime is when its last upload landed; stamping "now"
+            # would make every session look freshly uploaded after an upgrade.
+            uploaded = datetime.fromtimestamp(f.stat().st_mtime, timezone.utc).isoformat()
+            self.index_transcript(f.stem, f, None, None, uploaded)
+            if progress and time.monotonic() - last_report >= PROGRESS_EVERY_SECONDS:
+                progress(done, len(files))
+                last_report = time.monotonic()
+        return len(files)
+
+    def derived_version(self) -> int:
+        with self.connect() as db:
+            row = db.execute(
+                "SELECT value FROM meta WHERE key = 'derived_version'").fetchone()
+        try:
+            return int(row["value"]) if row else 0
+        except ValueError:
+            return 0
+
+    def _set_derived_version(self, version: int):
+        with self.connect() as db:
+            db.execute(
+                """INSERT INTO meta (key, value) VALUES ('derived_version', ?)
+                   ON CONFLICT(key) DO UPDATE SET value = excluded.value""",
+                (str(version),))
+            db.commit()
+
+    def rederive_if_stale(self, progress=None):
+        """Bring derived index data up to the code's DERIVED_VERSION from the
+        stored transcripts, so upgrades never need a manual rebuild-index.
+        Returns a summary dict, or None when already current (or when there
+        is nothing to derive yet — a fresh install is not an upgrade)."""
+        found = self.derived_version()
+        if found >= DERIVED_VERSION:
+            return None
+        with self.connect() as db:
+            has_sessions = db.execute("SELECT 1 FROM sessions LIMIT 1").fetchone()
+        if not has_sessions and not any(self.transcripts_dir.glob("*.jsonl")):
+            self._set_derived_version(DERIVED_VERSION)
+            return None
+        started = time.monotonic()
+        transcripts = self._reindex_transcripts(progress)
+        self._set_derived_version(DERIVED_VERSION)
+        return {"from": found, "to": DERIVED_VERSION, "transcripts": transcripts,
+                "seconds": round(time.monotonic() - started, 2)}
+
+
+# Model values that name no real model: Claude Code stamps "<synthetic>" on
+# messages it fabricates locally (interruptions, API errors). They carry no
+# billed usage and must never show up as a model.
+PLACEHOLDER_MODELS = frozenset({"<synthetic>"})
+
+
+def _token(value):
+    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else 0
+
+
+def transcript_turns(source):
+    """Parse a Claude Code transcript (bytes, or a binary file object read
+    line by line) into model turns. Returns (turns, lines).
+
+    Claude Code writes one line per content block and repeats the message's
+    id and identical usage on every line, so a turn is one distinct
+    message.id — summing lines would multiply tokens by the block count.
+    The first line of a message wins. Lines without an id cannot be matched
+    and count individually."""
+    if isinstance(source, (bytes, bytearray)):
+        source = io.BytesIO(source)  # same line splitting as a stored file
+    turns = []
+    seen_ids = set()
     lines = 0
-    for line in data.splitlines():
+    for n, line in enumerate(source):
         if not line.strip():
             continue
         lines += 1
@@ -378,18 +467,43 @@ def summarize_transcript(data: bytes):
             e = json.loads(line)
         except (json.JSONDecodeError, UnicodeDecodeError):
             continue
-        msg = e.get("message") or {}
+        msg = e.get("message") if isinstance(e, dict) else None
         if not isinstance(msg, dict):
             continue
-        if msg.get("model"):
-            models.add(msg["model"])
-        usage = msg.get("usage") or {}
-        if isinstance(usage, dict):
-            totals["input_tokens"] += usage.get("input_tokens") or 0
-            totals["output_tokens"] += usage.get("output_tokens") or 0
-            totals["cache_read_tokens"] += usage.get("cache_read_input_tokens") or 0
-            totals["cache_creation_tokens"] += usage.get("cache_creation_input_tokens") or 0
-    return {**totals, "lines": lines, "models": ",".join(sorted(models)) or None}
+        model = msg.get("model")
+        if not isinstance(model, str) or not model or model in PLACEHOLDER_MODELS:
+            continue
+        msg_id = msg.get("id")
+        if isinstance(msg_id, str) and msg_id:
+            if msg_id in seen_ids:
+                continue
+            seen_ids.add(msg_id)
+            key = msg_id
+        else:
+            key = f"line:{n}"
+        usage = msg.get("usage") if isinstance(msg.get("usage"), dict) else {}
+        turns.append({
+            "key": key,
+            "model": model,
+            "ts": e.get("timestamp") if isinstance(e.get("timestamp"), str) else None,
+            "input_tokens": _token(usage.get("input_tokens")),
+            "output_tokens": _token(usage.get("output_tokens")),
+            "cache_read_tokens": _token(usage.get("cache_read_input_tokens")),
+            "cache_creation_tokens": _token(usage.get("cache_creation_input_tokens")),
+        })
+    return turns, lines
+
+
+def summarize_transcript(source):
+    """Token usage + models of a transcript snapshot. Understands the Claude
+    Code JSONL format; other sources contribute only a line count (their
+    events carry the model per record). Usage on a message that names no
+    model is not attributable to any model and is not counted."""
+    turns, lines = transcript_turns(source)
+    totals = {k: sum(t[k] for t in turns) for k in
+              ("input_tokens", "output_tokens", "cache_read_tokens", "cache_creation_tokens")}
+    models = sorted({t["model"] for t in turns})
+    return {**totals, "lines": lines, "models": ",".join(models) or None}
 
 
 def utcnow() -> str:
@@ -1230,6 +1344,15 @@ def serve(args):
         print("  First run — sign in to the console with admin / admin.", flush=True)
         print("  You will be required to set a new password immediately.", flush=True)
         print("=" * 64, flush=True)
+
+    # Before binding: re-derivation rewrites session rows that live ingest
+    # would otherwise race with.
+    rederived = store.rederive_if_stale(progress=lambda done, total: print(
+        f"re-deriving index: {done}/{total} transcripts", flush=True))
+    if rederived:
+        print(f"derived-index schema {rederived['from']} -> {rederived['to']}: "
+              f"{rederived['transcripts']} transcripts re-indexed in "
+              f"{rederived['seconds']}s", flush=True)
 
     httpd = ThreadingHTTPServer((args.host, args.port), Handler)
     httpd.daemon_threads = True

@@ -204,6 +204,22 @@ rsync -a /var/lib/gaide-trace/data/ backup-host:/backups/gaide-trace/
 If `trace.db` is ever lost or corrupted, `rebuild-index` reconstructs it from
 the JSONL archive.
 
+**Upgrades re-derive the index on their own.** When a release changes how
+index data is derived from the stored transcripts, the server re-derives
+existing data on its first start, before it accepts connections, and logs one
+line (`derived-index schema N -> M: ...`, plus progress lines on long runs;
+a 50 MB transcript takes well under a second). The archive
+and transcript files are never modified; no manual `rebuild-index` is needed.
+
+**Token totals drop after upgrading past v0.3.1 — that is a correction.**
+Claude Code writes each assistant message to its transcript as one line per
+content block, repeating the same usage on every line. Up to v0.3.1 the server
+summed every line, inflating session and overview token totals for Claude Code
+sessions (by roughly 2–3× on real data). The server now counts each message
+once (by its `message.id`) and ignores Claude Code's `<synthetic>` placeholder
+messages. Token figures exported or quoted from earlier versions were
+inflated.
+
 ## 7. API (for your own tooling)
 
 **Upgrading from v0.2:** event names are now the canonical tool-agnostic
