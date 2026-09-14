@@ -70,7 +70,8 @@ VERSION = "0.3.1"
 # change: `serve` re-derives existing data on start (see
 # Store.rederive_if_stale), so an upgrade needs no manual rebuild-index.
 #   1 — transcript usage counted once per message, placeholder models dropped
-DERIVED_VERSION = 1
+#   2 — session time ranges lost to a transcript-first arrival are restored
+DERIVED_VERSION = 2
 PROGRESS_EVERY_SECONDS = 5
 
 MAX_EVENTS_BODY = 32 * 1024 * 1024        # 32 MB per events batch
@@ -288,8 +289,10 @@ class Store:
                  events = events + 1,
                  project = COALESCE(sessions.project, excluded.project),
                  origin = COALESCE(sessions.origin, excluded.origin),
-                 first_ts = MIN(sessions.first_ts, excluded.first_ts),
-                 last_ts = MAX(sessions.last_ts, excluded.last_ts)""",
+                 -- scalar MIN/MAX return NULL if either side is NULL, and a
+                 -- transcript upload creates the row with no times
+                 first_ts = MIN(COALESCE(sessions.first_ts, excluded.first_ts), excluded.first_ts),
+                 last_ts = MAX(COALESCE(sessions.last_ts, excluded.last_ts), excluded.last_ts)""",
             (row["session_id"], row["project"], row["origin"], row["ts"], row["ts"]),
         )
         if ev == "prompt.submit":
@@ -415,6 +418,15 @@ class Store:
                 (str(version),))
             db.commit()
 
+    def _repair_session_times(self):
+        with self.connect() as db:
+            db.execute(
+                """UPDATE sessions SET
+                     first_ts = (SELECT MIN(ts) FROM events e WHERE e.session_id = sessions.session_id),
+                     last_ts = (SELECT MAX(ts) FROM events e WHERE e.session_id = sessions.session_id)
+                   WHERE first_ts IS NULL OR last_ts IS NULL""")
+            db.commit()
+
     def rederive_if_stale(self, progress=None):
         """Bring derived index data up to the code's DERIVED_VERSION from the
         stored transcripts, so upgrades never need a manual rebuild-index.
@@ -429,6 +441,7 @@ class Store:
             self._set_derived_version(DERIVED_VERSION)
             return None
         started = time.monotonic()
+        self._repair_session_times()
         transcripts = self._reindex_transcripts(progress)
         self._set_derived_version(DERIVED_VERSION)
         return {"from": found, "to": DERIVED_VERSION, "transcripts": transcripts,
