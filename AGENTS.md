@@ -10,7 +10,7 @@
 
 **One-line description:** a research-grade, LLM- and IDE-agnostic interaction ledger that records what actually happened in AI-assisted development sessions (prompts, tool calls, turns, transcripts), with an optional team server.
 
-**Current status:** in development (v0.3.1) — capture adapters for Claude Code and the Antigravity IDE, optional team server with web console.
+**Current status:** in development (v0.4.0) — capture adapters for Claude Code and the Antigravity IDE, optional team server with web console (per-model usage and cost estimates).
 
 **Relationship to [GAIDE](https://github.com/jcarlos78/GAIDE):** GAIDE governs *how* AI-assisted development happens; GAIDE-Trace records *what happened*. They are separate, independently adoptable projects — and this repository is itself developed under the GAIDE harness (see [ADR 0001](docs/adr/0001-adopt-gaide-harness.md)). Keep the distinction sharp when editing: GAIDE-Trace must never require GAIDE to be useful.
 
