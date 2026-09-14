@@ -52,6 +52,7 @@ import hashlib
 import hmac
 import io
 import json
+import math
 import os
 import re
 import secrets
@@ -71,8 +72,33 @@ VERSION = "0.3.1"
 # Store.rederive_if_stale), so an upgrade needs no manual rebuild-index.
 #   1 — transcript usage counted once per message, placeholder models dropped
 #   2 — session time ranges lost to a transcript-first arrival are restored
-DERIVED_VERSION = 2
+#   3 — per-turn model usage (model_turns) and each session's dominant model
+DERIVED_VERSION = 3
 PROGRESS_EVERY_SECONDS = 5
+
+# Model names come from ingested data an agent key controls; cap what the
+# index stores so a hostile client cannot bloat it through this field.
+MAX_MODEL_NAME = 128
+# Far above any real message (context windows are ~10^6) and within SQLite's
+# 64-bit INTEGER for one value. It does not make sums safe — enough maximal
+# turns still pass 2^63 — which is why aggregates use sum_tokens().
+MAX_TOKENS_PER_TURN = 10 ** 12
+# Per-model rows returned by the API: every real team fits, a flood of
+# distinct names from a hostile client does not reach browsers.
+MAX_MODEL_ROWS = 500
+
+# USD per million tokens, per token type. The ceiling only has to be far above
+# any real list price while still catching a unit slip (per-token vs per-MTok).
+PRICE_FIELDS = ("input", "output", "cache_read", "cache_write_5m", "cache_write_1h")
+PRICE_TOKEN_COLUMNS = dict(zip(PRICE_FIELDS, (
+    "input_tokens", "output_tokens", "cache_read_tokens",
+    "cache_write_5m_tokens", "cache_write_1h_tokens")))
+MAX_PRICE_PER_MTOK = 10_000
+
+# Models drawn as their own series in the Overview per-day chart; the rest are
+# folded into one "other" bucket, which also bounds the response size. Four
+# categorical slots are what passed CVD validation on the console's tile.
+CHART_SERIES = 4
 
 MAX_EVENTS_BODY = 32 * 1024 * 1024        # 32 MB per events batch
 MAX_TRANSCRIPT_BODY = 256 * 1024 * 1024   # 256 MB per transcript snapshot
@@ -99,6 +125,20 @@ LEGACY_EVENTS = {
     "PreCompact": "context.compact",
     "SessionEnd": "session.end",
 }
+
+
+def event_row(rec: dict) -> dict:
+    """The indexable columns of an ingested record. Every column is text; a
+    client sending a number, boolean or object gets it stored as JSON text
+    rather than failing the whole batch (SQLite cannot bind a dict or an int
+    past 64 bits, and an unhashable `event` would break the legacy lookup)."""
+    row = {}
+    for c in EVENT_COLUMNS:
+        value = rec.get(c)
+        if value is not None and not isinstance(value, str):
+            value = json.dumps(value, ensure_ascii=False)
+        row[c] = value
+    return normalize_event(row)
 
 
 def normalize_event(row: dict):
@@ -217,9 +257,41 @@ class Store:
           cache_creation_tokens INTEGER,
           transcript_bytes INTEGER,
           transcript_lines INTEGER,
-          transcript_updated_at TEXT
+          transcript_updated_at TEXT,
+          dominant_model TEXT,
+          model_count INTEGER NOT NULL DEFAULT 0
         );
         CREATE INDEX IF NOT EXISTS idx_sessions_last ON sessions(last_ts);
+        CREATE TABLE IF NOT EXISTS model_turns (
+          session_id TEXT NOT NULL,
+          turn_key TEXT NOT NULL,
+          model TEXT NOT NULL,
+          source TEXT NOT NULL CHECK (source IN ('transcript','events')),
+          ts TEXT,
+          input_tokens INTEGER,
+          output_tokens INTEGER,
+          cache_read_tokens INTEGER,
+          cache_write_5m_tokens INTEGER,
+          cache_write_1h_tokens INTEGER,
+          premium INTEGER NOT NULL DEFAULT 0,
+          PRIMARY KEY (session_id, turn_key)
+        );
+        CREATE INDEX IF NOT EXISTS idx_model_turns_ts ON model_turns(ts);
+        CREATE INDEX IF NOT EXISTS idx_model_turns_model ON model_turns(model, ts);
+        -- Sessions "used model X" filter: without it the EXISTS probe scans
+        -- every turn of X once per session row.
+        CREATE INDEX IF NOT EXISTS idx_model_turns_session_model
+          ON model_turns(session_id, model);
+        CREATE TABLE IF NOT EXISTS model_prices (
+          model TEXT PRIMARY KEY,
+          input REAL NOT NULL,
+          output REAL NOT NULL,
+          cache_read REAL NOT NULL,
+          cache_write_5m REAL NOT NULL,
+          cache_write_1h REAL NOT NULL,
+          updated_at TEXT NOT NULL,
+          updated_by TEXT
+        );
         CREATE TABLE IF NOT EXISTS meta (
           key TEXT PRIMARY KEY,
           value TEXT
@@ -230,6 +302,11 @@ class Store:
         for col in ("native_event", "source"):
             if col not in cols:
                 db.execute(f"ALTER TABLE events ADD COLUMN {col} TEXT")
+        cols = {r[1] for r in db.execute("PRAGMA table_info(sessions)")}
+        if "dominant_model" not in cols:
+            db.execute("ALTER TABLE sessions ADD COLUMN dominant_model TEXT")
+        if "model_count" not in cols:
+            db.execute("ALTER TABLE sessions ADD COLUMN model_count INTEGER NOT NULL DEFAULT 0")
         db.commit()
 
     # ---- events ingest ----
@@ -243,7 +320,7 @@ class Store:
             for rec in records:
                 if not isinstance(rec, dict):
                     continue
-                row = normalize_event({c: rec.get(c) for c in EVENT_COLUMNS})
+                row = event_row(rec)
                 if not row["trace_id"] or not row["session_id"] or not row["event"]:
                     continue
                 row["received_at"] = now
@@ -261,8 +338,13 @@ class Store:
                     accepted.append(row)
                 else:
                     duplicates += 1
+            touched = set()
             for row in accepted:
                 self._bump_session(db, row)
+                if self._add_event_turn(db, row):
+                    touched.add(row["session_id"])
+            for sid in touched:
+                self._summarize_session_models(db, sid)
             db.commit()
         # Raw archive: append accepted records to per-session JSONL. The
         # archive, not SQLite, is the source of truth (index is rebuildable).
@@ -305,6 +387,70 @@ class Store:
             db.execute("UPDATE sessions SET failures = failures + 1 WHERE session_id = ?",
                        (row["session_id"],))
 
+    # ---- model usage ----
+
+    @staticmethod
+    def _add_event_turn(db, row) -> bool:
+        """Record a live model.turn event as a turn, unless the session's
+        transcript already accounts for its turns — the two sources are never
+        added together. Returns whether a turn was recorded."""
+        model = model_name(row.get("model"))
+        if row["event"] != "model.turn" or not model:
+            return False
+        if db.execute("SELECT 1 FROM model_turns WHERE session_id = ? AND source = 'transcript'"
+                      " LIMIT 1", (row["session_id"],)).fetchone():
+            return False
+        cur = db.execute(
+            """INSERT OR IGNORE INTO model_turns (session_id, turn_key, model, source, ts)
+               VALUES (?,?,?,'events',?)""",
+            (row["session_id"], row["trace_id"], model, utc_iso(row["ts"])))
+        return bool(cur.rowcount)
+
+    @staticmethod
+    def _replace_session_models(db, session_id, turns):
+        """The one place the source rule lives: a session's turns come from
+        its transcript when that yields any, otherwise from its model.turn
+        events."""
+        db.execute("DELETE FROM model_turns WHERE session_id = ?", (session_id,))
+        if turns:
+            db.executemany(
+                """INSERT OR IGNORE INTO model_turns
+                     (session_id, turn_key, model, source, ts, input_tokens, output_tokens,
+                      cache_read_tokens, cache_write_5m_tokens, cache_write_1h_tokens, premium)
+                   VALUES (?,?,?,'transcript',?,?,?,?,?,?,?)""",
+                [(session_id, t["key"], t["model"], t["ts"], t["input_tokens"],
+                  t["output_tokens"], t["cache_read_tokens"], t["cache_write_5m_tokens"],
+                  t["cache_write_1h_tokens"], int(t["premium"])) for t in turns])
+        else:
+            for ev in db.execute(
+                    "SELECT trace_id, ts, model FROM events"
+                    " WHERE session_id = ? AND event = 'model.turn'",
+                    (session_id,)).fetchall():
+                model = model_name(ev["model"])
+                if model:
+                    db.execute(
+                        """INSERT OR IGNORE INTO model_turns
+                             (session_id, turn_key, model, source, ts)
+                           VALUES (?,?,?,'events',?)""",
+                        (session_id, ev["trace_id"], model, utc_iso(ev["ts"])))
+        Store._summarize_session_models(db, session_id)
+
+    @staticmethod
+    def _summarize_session_models(db, session_id):
+        rows = db.execute(
+            """SELECT model FROM model_turns WHERE session_id = ?
+               GROUP BY model
+               ORDER BY COUNT(*) DESC, TOTAL(output_tokens) DESC, model""",
+            (session_id,)).fetchall()
+        db.execute("UPDATE sessions SET dominant_model = ?, model_count = ? WHERE session_id = ?",
+                   (rows[0]["model"] if rows else None, len(rows), session_id))
+
+    def session_models(self, session_id):
+        """Per-model usage of one session. Token sums are None for turns whose
+        source has no token data."""
+        with self.connect() as db:
+            return model_usage_rows(db, " WHERE mt.session_id = ?", [session_id])
+
     # ---- transcripts ----
 
     def store_transcript(self, session_id: str, data: bytes, project, origin):
@@ -323,10 +469,11 @@ class Store:
         if isinstance(source, Path):
             size = source.stat().st_size
             with source.open("rb") as fh:
-                stats = summarize_transcript(fh)
+                turns, lines = transcript_turns(fh)
         else:
             size = len(source)
-            stats = summarize_transcript(source)
+            turns, lines = transcript_turns(source)
+        stats = summarize_turns(turns, lines)
         with self.connect() as db:
             db.execute(
                 """INSERT INTO sessions (session_id, project, origin) VALUES (?,?,?)
@@ -347,6 +494,7 @@ class Store:
                  stats["cache_read_tokens"], stats["cache_creation_tokens"],
                  stats["models"], session_id),
             )
+            self._replace_session_models(db, session_id, turns)
             db.commit()
         return {"bytes": size, "lines": stats["lines"]}
 
@@ -360,6 +508,7 @@ class Store:
         with self.connect() as db:
             db.execute("DELETE FROM events")
             db.execute("DELETE FROM sessions")
+            db.execute("DELETE FROM model_turns")
             db.commit()
             n = 0
             for f in sorted(self.archive_dir.glob("*.jsonl")):
@@ -368,9 +517,11 @@ class Store:
                         continue
                     try:
                         rec = json.loads(line)
-                    except json.JSONDecodeError:
+                    except (ValueError, RecursionError):
                         continue
-                    row = normalize_event({c: rec.get(c) for c in EVENT_COLUMNS})
+                    if not isinstance(rec, dict):
+                        continue
+                    row = event_row(rec)
                     if not row["trace_id"]:
                         continue
                     cur = db.execute(
@@ -382,24 +533,52 @@ class Store:
                         self._bump_session(db, row)
                         n += 1
             db.commit()
-        self._reindex_transcripts()
+        self._rederive_all()
         self._set_derived_version(DERIVED_VERSION)
         return n
 
     # ---- derived-data versioning ----
 
-    def _reindex_transcripts(self, progress=None):
+    def _rederive_all(self, progress=None):
+        """Re-derive transcript accounting and model usage for every session.
+        Returns (transcripts re-indexed, session ids that failed).
+
+        Stored data was written by clients an agent key controls. One session
+        that cannot be derived is logged and skipped: aborting would keep the
+        whole server from starting, or make rebuild-index unusable."""
         files = sorted(self.transcripts_dir.glob("*.jsonl"))
+        failed = []
+
+        def skipped(sid, exc):
+            failed.append(sid)
+            print(f"re-deriving index: skipped session {sid}: {exc!r}",
+                  file=sys.stderr, flush=True)
+
+        with_transcript = {f.stem for f in files}
+        with self.connect() as db:
+            sids = [r[0] for r in db.execute("SELECT session_id FROM sessions").fetchall()]
+        for sid in sids:
+            if sid in with_transcript:
+                continue
+            try:
+                with self.connect() as db:
+                    self._replace_session_models(db, sid, None)
+                    db.commit()
+            except Exception as exc:
+                skipped(sid, exc)
         last_report = time.monotonic()
         for done, f in enumerate(files, 1):
             # The file's mtime is when its last upload landed; stamping "now"
             # would make every session look freshly uploaded after an upgrade.
             uploaded = datetime.fromtimestamp(f.stat().st_mtime, timezone.utc).isoformat()
-            self.index_transcript(f.stem, f, None, None, uploaded)
+            try:
+                self.index_transcript(f.stem, f, None, None, uploaded)
+            except Exception as exc:
+                skipped(f.stem, exc)
             if progress and time.monotonic() - last_report >= PROGRESS_EVERY_SECONDS:
                 progress(done, len(files))
                 last_report = time.monotonic()
-        return len(files)
+        return len(files) - sum(1 for sid in failed if sid in with_transcript), failed
 
     def derived_version(self) -> int:
         with self.connect() as db:
@@ -428,10 +607,12 @@ class Store:
             db.commit()
 
     def rederive_if_stale(self, progress=None):
-        """Bring derived index data up to the code's DERIVED_VERSION from the
-        stored transcripts, so upgrades never need a manual rebuild-index.
-        Returns a summary dict, or None when already current (or when there
-        is nothing to derive yet — a fresh install is not an upgrade)."""
+        """Bring derived index data up to the code's DERIVED_VERSION — session
+        time ranges from indexed events, transcript accounting and model usage
+        from stored transcripts and model.turn events — so upgrades never need
+        a manual rebuild-index. Returns a summary dict, or None when already
+        current (or when there is nothing to derive yet — a fresh install is
+        not an upgrade)."""
         found = self.derived_version()
         if found >= DERIVED_VERSION:
             return None
@@ -442,10 +623,13 @@ class Store:
             return None
         started = time.monotonic()
         self._repair_session_times()
-        transcripts = self._reindex_transcripts(progress)
+        transcripts, failed = self._rederive_all(progress)
+        # Recorded even with failures: they are logged per session, and a
+        # session re-derives on its next transcript upload or rebuild-index
+        # (events-only sessions have no upload, so only the latter).
         self._set_derived_version(DERIVED_VERSION)
         return {"from": found, "to": DERIVED_VERSION, "transcripts": transcripts,
-                "seconds": round(time.monotonic() - started, 2)}
+                "failed": failed, "seconds": round(time.monotonic() - started, 2)}
 
 
 # Model values that name no real model: Claude Code stamps "<synthetic>" on
@@ -454,8 +638,44 @@ class Store:
 PLACEHOLDER_MODELS = frozenset({"<synthetic>"})
 
 
+def model_name(value):
+    """A model value usable for attribution, or None for missing and
+    placeholder values."""
+    if not isinstance(value, str) or not value or value in PLACEHOLDER_MODELS:
+        return None
+    return value[:MAX_MODEL_NAME]
+
+
+def utc_iso(value):
+    """Normalize a timestamp to UTC ISO-8601 so day buckets and window
+    comparisons line up across sources ("Z" suffixes, offsets, naive)."""
+    if not isinstance(value, str) or not value:
+        return None
+    text = value[:-1] + "+00:00" if value.endswith(("Z", "z")) else value
+    try:
+        parsed = datetime.fromisoformat(text)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        # Dates at the edge of the calendar parse, then overflow on conversion.
+        return parsed.astimezone(timezone.utc).isoformat()
+    except (ValueError, OverflowError):
+        return None
+
+
 def _token(value):
-    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else 0
+    """A usable token count, else 0. Counts past MAX_TOKENS_PER_TURN are
+    garbage, and would overflow SQLite's 64-bit INTEGER on insert or SUM."""
+    if isinstance(value, int) and not isinstance(value, bool) and 0 < value <= MAX_TOKENS_PER_TURN:
+        return value
+    return 0
+
+
+def _turn_key(msg_id: str) -> str:
+    """Bound the stored key without losing de-duplication: long ids (which
+    no real transcript has) are replaced by their digest."""
+    if len(msg_id) <= MAX_MODEL_NAME:
+        return msg_id
+    return "sha256:" + hashlib.sha256(msg_id.encode("utf-8", "surrogatepass")).hexdigest()
 
 
 def transcript_turns(source):
@@ -478,31 +698,47 @@ def transcript_turns(source):
         lines += 1
         try:
             e = json.loads(line)
-        except (json.JSONDecodeError, UnicodeDecodeError):
+        # ValueError also covers bad UTF-8 and over-long number literals;
+        # RecursionError, absurdly nested lines. Skipping one line must never
+        # fail the upload.
+        except (ValueError, RecursionError):
             continue
         msg = e.get("message") if isinstance(e, dict) else None
         if not isinstance(msg, dict):
             continue
-        model = msg.get("model")
-        if not isinstance(model, str) or not model or model in PLACEHOLDER_MODELS:
+        model = model_name(msg.get("model"))
+        if not model:
             continue
         msg_id = msg.get("id")
         if isinstance(msg_id, str) and msg_id:
             if msg_id in seen_ids:
                 continue
             seen_ids.add(msg_id)
-            key = msg_id
+            key = _turn_key(msg_id)
         else:
             key = f"line:{n}"
         usage = msg.get("usage") if isinstance(msg.get("usage"), dict) else {}
+        cache_write = _token(usage.get("cache_creation_input_tokens"))
+        tiers = usage.get("cache_creation")
+        if isinstance(tiers, dict):
+            write_5m = _token(tiers.get("ephemeral_5m_input_tokens"))
+            write_1h = _token(tiers.get("ephemeral_1h_input_tokens"))
+        else:
+            # No tier breakdown: price everything at the cheaper 5-minute rate
+            # (spec AC18) rather than guess at a split.
+            write_5m, write_1h = cache_write, 0
+        speed = usage.get("speed")
         turns.append({
             "key": key,
             "model": model,
-            "ts": e.get("timestamp") if isinstance(e.get("timestamp"), str) else None,
+            "ts": utc_iso(e.get("timestamp")),
             "input_tokens": _token(usage.get("input_tokens")),
             "output_tokens": _token(usage.get("output_tokens")),
             "cache_read_tokens": _token(usage.get("cache_read_input_tokens")),
-            "cache_creation_tokens": _token(usage.get("cache_creation_input_tokens")),
+            "cache_creation_tokens": cache_write,
+            "cache_write_5m_tokens": write_5m,
+            "cache_write_1h_tokens": write_1h,
+            "premium": isinstance(speed, str) and speed != "standard",
         })
     return turns, lines
 
@@ -512,11 +748,94 @@ def summarize_transcript(source):
     Code JSONL format; other sources contribute only a line count (their
     events carry the model per record). Usage on a message that names no
     model is not attributable to any model and is not counted."""
-    turns, lines = transcript_turns(source)
+    return summarize_turns(*transcript_turns(source))
+
+
+def summarize_turns(turns, lines):
     totals = {k: sum(t[k] for t in turns) for k in
               ("input_tokens", "output_tokens", "cache_read_tokens", "cache_creation_tokens")}
     models = sorted({t["model"] for t in turns})
     return {**totals, "lines": lines, "models": ",".join(models) or None}
+
+
+def sum_tokens(column: str) -> str:
+    """SQL for an overflow-safe token sum that stays NULL when every value is
+    NULL (unknown, not zero). SQLite's SUM() raises "integer overflow" past
+    2^63, and ingested counts are client-controlled: a few maximal uploads
+    would take down every aggregate view. TOTAL() is floating point and
+    never overflows; callers turn the result back into an int."""
+    return f"CASE WHEN COUNT({column}) = 0 THEN NULL ELSE TOTAL({column}) END"
+
+
+def int_or_none(value):
+    return None if value is None else int(value)
+
+
+def model_usage_rows(db, where: str, params):
+    """Per-model aggregates over model_turns (alias mt, joined to sessions as
+    s), most-used first. `where` is a trusted SQL fragment built by callers
+    from fixed column names; values only ever travel in `params`."""
+    token_cols = ("input_tokens", "output_tokens", "cache_read_tokens",
+                  "cache_write_5m_tokens", "cache_write_1h_tokens")
+    rows = db.execute(
+        f"""SELECT mt.model AS model,
+                   GROUP_CONCAT(DISTINCT mt.source) AS source,
+                   COUNT(DISTINCT mt.session_id) AS sessions,
+                   COUNT(*) AS turns,
+                   COUNT(*) - COUNT(mt.output_tokens) AS turns_without_tokens,
+                   {', '.join(f'{sum_tokens("mt." + c)} AS {c}' for c in token_cols)},
+                   SUM(mt.premium) AS premium_turns,
+                   MIN(mt.ts) AS first_ts, MAX(mt.ts) AS last_ts
+            FROM model_turns mt JOIN sessions s ON s.session_id = mt.session_id
+            {where}
+            GROUP BY mt.model
+            ORDER BY turns DESC, TOTAL(mt.output_tokens) DESC, mt.model""",
+        params).fetchall()
+    out = []
+    for r in rows:
+        row = dict(r)
+        for c in token_cols:
+            row[c] = int_or_none(row[c])
+        out.append(row)
+    return out
+
+
+def load_prices(db):
+    return {r["model"]: dict(r) for r in db.execute("SELECT * FROM model_prices")}
+
+
+def price_rows(rows, prices):
+    """Annotate per-model rows with an estimated cost and return totals.
+
+    cost_status: `priced`, `unpriced` (no price entry — cost is never guessed)
+    or `no_tokens` (the source recorded no usage, so there is nothing to
+    price; counted apart from unpriced). Costs are left unrounded."""
+    totals = {"turns": 0, "premium_turns": 0, "premium_priced_turns": 0, "cost_total": None,
+              "unpriced_models": 0, "no_token_models": 0,
+              **{col: None for col in PRICE_TOKEN_COLUMNS.values()}}
+    for row in rows:
+        totals["turns"] += row["turns"]
+        totals["premium_turns"] += row["premium_turns"] or 0
+        for col in PRICE_TOKEN_COLUMNS.values():
+            if row[col] is not None:
+                totals[col] = (totals[col] or 0) + row[col]
+        price = prices.get(row["model"])
+        if row["turns_without_tokens"] == row["turns"]:
+            row["cost"], row["cost_status"] = None, "no_tokens"
+            totals["no_token_models"] += 1
+        elif price is None:
+            row["cost"], row["cost_status"] = None, "unpriced"
+            totals["unpriced_models"] += 1
+        else:
+            spend = 0
+            for field, col in PRICE_TOKEN_COLUMNS.items():
+                spend += (row[col] or 0) * price[field]
+            row["cost"], row["cost_status"] = spend / 1_000_000, "priced"
+            totals["cost_total"] = (totals["cost_total"] or 0) + row["cost"]
+            # Only these make the total a lower bound: premium turns of an
+            # unpriced model are not in the estimate at all.
+            totals["premium_priced_turns"] += row["premium_turns"] or 0
+    return rows, totals
 
 
 def utcnow() -> str:
@@ -849,6 +1168,17 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(self.api_sessions(q))
             return
 
+        if m == ("GET", "/api/v1/models"):
+            if self.require("member"):
+                self.send_json(self.api_models())
+            return
+
+        if m == ("PUT", "/api/v1/models/prices"):
+            return self.api_set_price()
+
+        if m == ("DELETE", "/api/v1/models/prices"):
+            return self.api_clear_price(q)
+
         if method == "GET" and path.startswith("/api/v1/sessions/"):
             rest = path.split("/api/v1/sessions/", 1)[1]
             if rest.endswith("/transcript"):
@@ -914,7 +1244,7 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_error_json(413, "missing or oversized body")
         try:
             records = json.loads(body)
-        except json.JSONDecodeError:
+        except (ValueError, RecursionError):  # also over-long literals, deep nesting
             return self.send_error_json(400, "body must be a JSON array of event records")
         if isinstance(records, dict):
             records = [records]
@@ -939,7 +1269,9 @@ class Handler(BaseHTTPRequestHandler):
     def _json_body(self, max_len=64 * 1024):
         try:
             return json.loads(self.read_body(max_len) or b"{}")
-        except json.JSONDecodeError:
+        # ValueError covers JSONDecodeError and over-long integer literals;
+        # RecursionError, deeply nested arrays. All are client errors.
+        except (ValueError, RecursionError):
             return None
 
     # -- console auth & user management --
@@ -1121,6 +1453,89 @@ class Handler(BaseHTTPRequestHandler):
         # Registration + key are gone; already-ingested trace data is kept.
         self.send_json({"ok": True})
 
+    # -- models and prices --
+
+    def api_models(self):
+        """The most-used models seen in the data plus every priced model, so
+        admins can see which models still need a price. `omitted` counts seen
+        models beyond MAX_MODEL_ROWS."""
+        stats = """SELECT model, COUNT(*) AS turns, COUNT(DISTINCT session_id) AS sessions,
+                          MAX(ts) AS last_ts
+                   FROM model_turns"""
+        with self.store.connect() as db:
+            top = {r["model"]: dict(r) for r in db.execute(
+                stats + " GROUP BY model ORDER BY turns DESC, model LIMIT ?", (MAX_MODEL_ROWS,))}
+            seen_total = db.execute(
+                "SELECT COUNT(DISTINCT model) AS n FROM model_turns").fetchone()["n"]
+            prices = load_prices(db)
+            # A priced model below the top rows still needs its real usage, and
+            # must not be counted as omitted while it is listed.
+            priced_rest = [m for m in prices if m not in top]
+            seen = dict(top)
+            for i in range(0, len(priced_rest), 500):  # stay under SQLite's variable limit
+                chunk = priced_rest[i:i + 500]
+                seen.update({r["model"]: dict(r) for r in db.execute(
+                    stats + f" WHERE model IN ({','.join('?' for _ in chunk)}) GROUP BY model",
+                    chunk)})
+        listed = []
+        for model in set(seen) | set(prices):
+            entry = seen.get(model) or {"model": model, "turns": 0, "sessions": 0,
+                                        "last_ts": None}
+            price = prices.get(model)
+            entry["price"] = ({k: v for k, v in price.items() if k != "model"}
+                              if price else None)
+            listed.append(entry)
+        listed.sort(key=lambda e: (-e["turns"], e["model"]))
+        return {"models": listed, "omitted": max(0, seen_total - len(seen))}
+
+    def api_set_price(self):
+        ident = self.require("admin")
+        if not ident:
+            return
+        payload = self._json_body()
+        if not isinstance(payload, dict):
+            return self.send_error_json(400, "body must be a JSON object")
+        model = payload.get("model")
+        if (not isinstance(model, str) or not model or len(model) > MAX_MODEL_NAME
+                or model in PLACEHOLDER_MODELS):
+            return self.send_error_json(
+                400, f"model must name a real model in 1-{MAX_MODEL_NAME} characters")
+        values = []
+        for field in PRICE_FIELDS:
+            value = payload.get(field)
+            # Range before isfinite: isfinite raises on ints too big for a float.
+            if (isinstance(value, bool) or not isinstance(value, (int, float))
+                    or (isinstance(value, float) and not math.isfinite(value))
+                    or not 0 <= value <= MAX_PRICE_PER_MTOK):
+                return self.send_error_json(
+                    400, f"{field} must be a number from 0 to {MAX_PRICE_PER_MTOK} "
+                         "(USD per million tokens)")
+            values.append(float(value))
+        entry = {"model": model, **dict(zip(PRICE_FIELDS, values)),
+                 "updated_at": utcnow(), "updated_by": ident["name"]}
+        with self.store.connect() as db:
+            db.execute(
+                f"""INSERT INTO model_prices ({','.join(entry)})
+                    VALUES ({','.join('?' for _ in entry)})
+                    ON CONFLICT(model) DO UPDATE SET
+                    {', '.join(f'{k} = excluded.{k}' for k in entry if k != 'model')}""",
+                list(entry.values()))
+            db.commit()
+        self.send_json(entry)
+
+    def api_clear_price(self, q):
+        if not self.require("admin"):
+            return
+        model = q.get("model")
+        if not model or len(model) > MAX_MODEL_NAME:
+            return self.send_error_json(400, f"need ?model= of 1-{MAX_MODEL_NAME} characters")
+        with self.store.connect() as db:
+            cur = db.execute("DELETE FROM model_prices WHERE model = ?", (model,))
+            db.commit()
+        if not cur.rowcount:
+            return self.send_error_json(404, "no price for that model")
+        self.send_json({"ok": True})
+
     @staticmethod
     def _filters(q, alias=""):
         """Build a WHERE fragment + params from project/from/to query params."""
@@ -1171,12 +1586,12 @@ class Handler(BaseHTTPRequestHandler):
                 swhere.append("first_ts < ?")
                 sparams.append(q["to"])
             sw = (" WHERE " + " AND ".join(swhere)) if swhere else ""
+            token_cols = ("input_tokens", "output_tokens", "cache_read_tokens",
+                          "cache_creation_tokens")
             tokens = db.execute(
-                f"""SELECT SUM(input_tokens) AS input_tokens,
-                           SUM(output_tokens) AS output_tokens,
-                           SUM(cache_read_tokens) AS cache_read_tokens,
-                           SUM(cache_creation_tokens) AS cache_creation_tokens
+                f"""SELECT {', '.join(f'{sum_tokens(c)} AS {c}' for c in token_cols)}
                     FROM sessions{sw}""", sparams).fetchone()
+            tokens = {c: int_or_none(tokens[c]) for c in token_cols}
             projects = db.execute(
                 f"""SELECT project, COUNT(*) AS sessions, SUM(prompts) AS prompts,
                            SUM(tool_calls) AS tool_calls, SUM(failures) AS failures,
@@ -1188,13 +1603,53 @@ class Handler(BaseHTTPRequestHandler):
                            SUM(tool_calls) AS tool_calls, MAX(last_ts) AS last_ts
                     FROM sessions{sw} GROUP BY origin ORDER BY last_ts DESC""",
                 sparams).fetchall()
+            models = self._overview_models(db, q)
         return {
             "totals": {**dict(totals), **dict(tokens)},
             "per_day": [dict(r) for r in per_day],
             "top_tools": [dict(r) for r in top_tools],
             "projects": [dict(r) for r in projects],
             "origins": [dict(r) for r in origins],
+            "models": models,
         }
+
+    @staticmethod
+    def _overview_models(db, q):
+        """Per-model statistics for the window. A turn is in the window by its
+        own timestamp, so a session crossing the boundary contributes only
+        the turns inside it."""
+        where, params = [], []
+        if q.get("project"):
+            where.append("s.project = ?")
+            params.append(q["project"])
+        if q.get("from"):
+            where.append("mt.ts >= ?")
+            params.append(q["from"])
+        if q.get("to"):
+            where.append("mt.ts < ?")
+            params.append(q["to"])
+        w = (" WHERE " + " AND ".join(where)) if where else ""
+        rows, totals = price_rows(model_usage_rows(db, w, params), load_prices(db))
+        for row in rows:
+            row["share"] = row["turns"] / totals["turns"]
+        # The view's own leaders get the colours (spec AC14). A model can
+        # change colour between filters; it is always named in the legend.
+        series = [r["model"] for r in rows[:CHART_SERIES]]
+        buckets = {}
+        for r in db.execute(
+                f"""SELECT substr(mt.ts, 1, 10) AS day, mt.model AS model, COUNT(*) AS turns
+                    FROM model_turns mt JOIN sessions s ON s.session_id = mt.session_id
+                    {w + (' AND ' if w else ' WHERE ')} mt.ts IS NOT NULL
+                    GROUP BY day, mt.model""", params):
+            key = (r["day"], r["model"] if r["model"] in series else None)
+            buckets[key] = buckets.get(key, 0) + r["turns"]
+        order = {m: i for i, m in enumerate(series)}
+        per_day = [{"day": day, "model": model, "turns": n} for (day, model), n in
+                   sorted(buckets.items(),
+                          key=lambda kv: (kv[0][0], order.get(kv[0][1], len(series))))]
+        # Totals and shares above cover every model; only the listing is cut.
+        return {"rows": rows[:MAX_MODEL_ROWS], "models_omitted": max(0, len(rows) - MAX_MODEL_ROWS),
+                "series": series, "per_day": per_day, **totals}
 
     def api_sessions(self, q):
         where, params = [], []
@@ -1213,6 +1668,10 @@ class Handler(BaseHTTPRequestHandler):
         if q.get("q"):
             where.append("session_id LIKE ?")
             params.append(f"%{q['q']}%")
+        if q.get("model"):
+            where.append("EXISTS (SELECT 1 FROM model_turns mt"
+                         " WHERE mt.session_id = sessions.session_id AND mt.model = ?)")
+            params.append(q["model"])
         w = (" WHERE " + " AND ".join(where)) if where else ""
         limit = min(int(q.get("limit") or 50), 500)
         offset = max(int(q.get("offset") or 0), 0)
@@ -1235,8 +1694,16 @@ class Handler(BaseHTTPRequestHandler):
             events = db.execute(
                 "SELECT * FROM events WHERE session_id = ? ORDER BY ts",
                 (session_id,)).fetchall()
+            models, models_total = price_rows(
+                model_usage_rows(db, " WHERE mt.session_id = ?", [session_id]),
+                load_prices(db))
         self.send_json({
             "session": dict(sess),
+            # One hostile transcript can name millions of models; the total
+            # still covers them all.
+            "models": models[:MAX_MODEL_ROWS],
+            "models_omitted": max(0, len(models) - MAX_MODEL_ROWS),
+            "models_total": models_total,
             "has_transcript": self.store.transcript_path(session_id) is not None,
             "events": [
                 {k: v for k, v in dict(e).items() if v is not None} for e in events
@@ -1366,6 +1833,10 @@ def serve(args):
         print(f"derived-index schema {rederived['from']} -> {rederived['to']}: "
               f"{rederived['transcripts']} transcripts re-indexed in "
               f"{rederived['seconds']}s", flush=True)
+        if rederived["failed"]:
+            print(f"WARNING: {len(rederived['failed'])} sessions could not be re-derived "
+                  "(logged above); they re-derive on their next transcript upload "
+                  "or rebuild-index", flush=True)
 
     httpd = ThreadingHTTPServer((args.host, args.port), Handler)
     httpd.daemon_threads = True

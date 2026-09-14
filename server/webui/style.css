@@ -46,9 +46,15 @@
   --serious: #ff832b;
   --critical: var(--support-error);
 
-  /* chart series — Carbon purple 60 + teal 50, validated on #262626 */
+  /* chart series — Carbon purple 60, teal 50, cyan 60, magenta 60, in this
+     order: validated on #262626 (adjacent CVD ΔE ≥ 14.1, normal-vision ≥ 15.6,
+     contrast ≥ 3:1). Red/orange/yellow/green steps stay reserved for status.
+     "Other" is the helper grey (4.56:1 on the tile). */
   --series-1: #8a3ffc;
   --series-2: #009d9a;
+  --series-3: #0072c3;
+  --series-4: #d02670;
+  --series-other: #8d8d8d;
 
   --sans: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
   --mono: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
@@ -260,7 +266,8 @@ main {
 .filters {
   display: flex; align-items: flex-end; gap: 16px; flex-wrap: wrap;
 }
-.filters .field { display: flex; flex-direction: column; gap: 8px; }
+.filters .field { display: flex; flex-direction: column; gap: 8px; min-width: 0; max-width: 100%; }
+.filters select { max-width: 100%; text-overflow: ellipsis; }
 
 /* Carbon content switcher */
 .range-presets { display: flex; }
@@ -326,14 +333,17 @@ main {
 .kpi .kpi-note.bad { color: var(--serious); }
 
 .grid-2 { display: grid; grid-template-columns: 3fr 2fr; gap: 16px; align-items: start; }
+/* grid items default to min-width:auto and grow to their widest content (a
+   long model name); let them shrink so tables scroll inside their card */
+.grid-2 > * { min-width: 0; }
 @media (max-width: 900px) { .grid-2 { grid-template-columns: 1fr; } }
 
 /* ------------------------------------------------ charts */
 
 .chart-wrap { position: relative; }
 .chart-wrap svg { display: block; width: 100%; height: auto; }
-.legend { display: flex; gap: 16px; margin-bottom: 16px; }
-.legend .key { display: flex; align-items: center; gap: 8px; font-size: 12px; letter-spacing: 0.32px; color: var(--text-secondary); }
+.legend { display: flex; flex-wrap: wrap; gap: 8px 16px; margin-bottom: 16px; }
+.legend .key { display: flex; align-items: center; gap: 8px; font-size: 12px; letter-spacing: 0.32px; color: var(--text-secondary); min-width: 0; max-width: 100%; overflow-wrap: anywhere; }
 .legend .swatch { width: 12px; height: 12px; }
 
 .tooltip {
@@ -350,6 +360,9 @@ main {
 .tooltip .tt-row { display: flex; align-items: center; gap: 8px; }
 .tooltip .tt-row .swatch { width: 10px; height: 10px; }
 .tooltip .tt-row b { color: var(--text-primary); margin-left: auto; padding-left: 16px; }
+.tooltip .tt-total { border-top: 1px solid var(--border-strong); margin-top: 4px; padding-top: 4px; }
+/* chart-made labels ("other models", "total"), never an ingested model name */
+em.bucket { font-style: italic; color: var(--text-helper); }
 
 /* ------------------------------------------------ data tables (Carbon) */
 
@@ -386,6 +399,25 @@ td .mono-id { font-family: var(--mono); font-size: 13px; color: var(--link); }
 }
 .badge.ok { background: #044317; color: #6fdc8c; }
 .badge.warn { background: #520408; color: #ff8389; }
+
+/* model usage */
+.model-cell { display: flex; align-items: center; gap: 8px; }
+.model-cell .swatch { width: 10px; height: 10px; flex: none; }
+.model-name { color: var(--text-primary); }
+.plus-n { margin-left: 8px; }
+.share-bar { display: flex; gap: 2px; height: 16px; margin-bottom: 16px; }
+.share-bar span { display: block; min-width: 2px; }
+tr.total td { color: var(--text-primary); font-weight: 600; border-bottom: none; }
+.notes { list-style: none; margin-top: 12px; display: flex; flex-direction: column; gap: 4px; }
+.notes li { font-size: 12px; letter-spacing: 0.32px; color: var(--text-helper); white-space: normal; }
+.notes li::before { content: "· "; }
+
+/* model prices (admin) */
+.price-input { width: 96px; padding: 0 8px; text-align: right; font-variant-numeric: tabular-nums; }
+.price-model-input { width: 220px; }
+.row-error { color: var(--support-error); font-size: 12px; letter-spacing: 0.32px; white-space: normal; }
+.row-error:empty { display: none; }
+td .actions { display: flex; gap: 1px; justify-content: flex-end; }
 
 .pager { display: flex; gap: 8px; align-items: center; justify-content: flex-end; margin-top: 16px; font-size: 12px; letter-spacing: 0.32px; color: var(--text-helper); }
 
@@ -439,7 +471,7 @@ td .mono-id { font-family: var(--mono); font-size: 13px; color: var(--link); }
 .tl-card.prompt { border-left-color: var(--series-1); }
 .tl-card.stop { border-left-color: var(--support-info); }
 .tl-card.fail { border-left-color: var(--support-error); }
-.tl-tag { font-size: 12px; letter-spacing: 0.32px; color: var(--text-helper); margin-bottom: 6px; display: flex; gap: 10px; align-items: center; }
+.tl-tag { font-size: 12px; letter-spacing: 0.32px; color: var(--text-helper); margin-bottom: 6px; display: flex; flex-wrap: wrap; gap: 4px 10px; align-items: center; overflow-wrap: anywhere; min-width: 0; }
 .tl-text { color: var(--text-secondary); white-space: pre-wrap; overflow-wrap: anywhere; }
 .tl-tool { display: flex; align-items: center; gap: 10px; cursor: pointer; user-select: none; }
 .tl-tool .tool-name { font-family: var(--mono); font-size: 13px; color: var(--text-primary); }

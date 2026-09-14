@@ -111,7 +111,7 @@ directory records the current version without logging an upgrade.
 
 ## Task 4 — Commit-1 docs, checks and review
 
-**Status:** in-progress
+**Status:** done
 
 **Files:** `docs/SERVER.md`
 
@@ -120,11 +120,11 @@ after upgrade, and why. Run `./init.sh`, `python3 -m unittest discover tests`,
 `code-reviewer`. Present the diff for approval and commit (HIC).
 
 **Done when:**
-- [ ] All tests green; `./init.sh` OK
+- [x] All tests green; `./init.sh` OK
 - [x] Code review findings addressed (blocker: sprint-contract command fixed in
   plan.md; suggestions applied except HTTP-API test → Task 7, version bump →
   maintainer at release)
-- [ ] Maintainer approved commit 1
+- [x] Maintainer approved commit 1 (`9defefb`; spec docs `fec34c8`, init fallback `46c7004`)
 
 **Estimate:** ~20 min
 
@@ -134,7 +134,7 @@ after upgrade, and why. Run `./init.sh`, `python3 -m unittest discover tests`,
 
 ## Task 5 — Failing tests for per-turn extraction and source rule
 
-**Status:** pending
+**Status:** done
 
 **Files:** `tests/test_transcript_usage.py`, `tests/test_model_usage_store.py`
 
@@ -144,7 +144,7 @@ events no-op), AC25 (rebuild parity), 5m/1h cache split present/absent,
 premium `speed`, model name > 128 chars (AC30).
 
 **Done when:**
-- [ ] Tests exist and fail for the right reason (missing functionality)
+- [x] Tests exist and fail for the right reason (missing functionality)
 
 **Estimate:** ~40 min
 
@@ -154,7 +154,7 @@ premium `speed`, model name > 128 chars (AC30).
 
 ## Task 6 — `model_turns` index and `refresh_session_models`
 
-**Status:** pending
+**Status:** done
 
 **Files:** `server/gaide_trace_server.py`
 
@@ -166,9 +166,15 @@ when no transcript rows exist, then recomputes D-b; `rebuild_index` clears and
 re-derives. Bump `DERIVED_VERSION` to 2. All in single transactions per session.
 
 **Done when:**
-- [ ] Task 5 tests pass
-- [ ] Migration test from Task 3 extended: a v0.3.1 index gains `model_turns`
+- [x] Task 5 tests pass
+- [x] Migration test from Task 3 extended: a v0.3.1 index gains `model_turns`
   on start (AC24)
+
+**Notes:** the source rule lives in `Store._replace_session_models` (plan D-c
+named it `refresh_session_models`). Re-derivation also refreshes sessions that
+have no transcript, from their `model.turn` events — so the mechanism now
+covers events too. `DERIVED_VERSION` is 3: version 2 went to the separate
+session-time-range bug fix, which lands as its own commit before this one.
 
 **Estimate:** ~60 min (split if it runs over: extraction / refresh+ingest)
 
@@ -178,7 +184,7 @@ re-derives. Bump `DERIVED_VERSION` to 2. All in single transactions per session.
 
 ## Task 7 — HTTP test harness + failing API tests
 
-**Status:** pending
+**Status:** done
 
 **Files:** `tests/server_harness.py`, `tests/test_model_usage_api.py`
 
@@ -187,8 +193,13 @@ an admin user, a member user, member and agent keys. Tests for AC8, AC9, AC11,
 AC12, AC15–AC17, AC19, AC21–AC23, AC26–AC28.
 
 **Done when:**
-- [ ] Harness starts/stops cleanly with no leftover threads or files
-- [ ] Tests exist and fail for missing endpoints/fields
+- [x] Harness starts/stops cleanly with no leftover threads or files
+- [x] Tests exist and fail for missing endpoints/fields
+
+**Notes:** in-process server via `http.client` (semgrep blocks dynamic
+`urllib` URLs). Test users get a pre-computed password hash and a direct
+console session, and the shutdown poll is 20 ms — the suite went from 28 s to
+1.5 s.
 
 **Estimate:** ~45 min
 
@@ -198,7 +209,7 @@ AC12, AC15–AC17, AC19, AC21–AC23, AC26–AC28.
 
 ## Task 8 — Price table and `/api/v1/models` endpoints
 
-**Status:** pending
+**Status:** done
 
 **Files:** `server/gaide_trace_server.py`
 
@@ -208,7 +219,7 @@ AC12, AC15–AC17, AC19, AC21–AC23, AC26–AC28.
 error), `updated_at`/`updated_by`. `rebuild-index` leaves it intact.
 
 **Done when:**
-- [ ] AC21 (API part), AC22 (API part), AC23, AC26, AC27, AC28 tests pass
+- [x] AC21 (API part), AC22 (API part), AC23, AC26, AC27, AC28 tests pass
 
 **Estimate:** ~40 min
 
@@ -218,7 +229,7 @@ error), `updated_at`/`updated_by`. `rebuild-index` leaves it intact.
 
 ## Task 9 — Session list/detail and overview API extensions with cost
 
-**Status:** pending
+**Status:** done
 
 **Files:** `server/gaide_trace_server.py`
 
@@ -230,8 +241,21 @@ at query time (plan D-g) with `cost_status`, `unpriced_models`,
 large index.
 
 **Done when:**
-- [ ] AC8, AC9, AC11, AC12, AC15, AC16, AC17, AC19 tests pass
-- [ ] Overview query uses the `ts` index (noted in the PR description)
+- [x] AC8, AC9, AC11, AC12, AC15, AC16, AC17, AC19 tests pass
+- [ ] Overview query uses the `ts` index — **not met as written**: on a
+  synthesized 200k-turn index SQLite prefers `idx_model_turns_model` to avoid a
+  sort for `GROUP BY model`. Measured 531 ms (all time), 142 ms (from a date),
+  108 ms (project + date). Acceptable at research-team scale; revisit if
+  indexes grow past ~1M turns. **Deviation accepted by the maintainer
+  (2026-09-14).**
+
+**Notes:** the Sessions `model` filter scanned every turn of the model per
+session row (703 ms at 200k turns); an added `(session_id, model)` index takes
+it to 1 ms. Beyond plan D-i: session detail also returns `models_total`
+(use case 1's session total); overview rows carry `turns_without_tokens`
+(a model name fed by both a token source and a no-token source is never
+silently under-priced); `models.series` names the chart's top models, and
+`per_day` folds the rest into `model: null`.
 
 **Estimate:** ~60 min (split if it runs over: sessions / overview)
 
@@ -241,7 +265,7 @@ large index.
 
 ## Task 10 — Validate the five-slot chart palette
 
-**Status:** pending
+**Status:** done
 
 **Files:** `server/webui/style.css`
 
@@ -251,7 +275,26 @@ separation). Add `--series-3`, `--series-4`, `--series-other` tokens. If it fail
 fall back to top 3 + other (plan D-j) and note it.
 
 **Done when:**
-- [ ] Validator output recorded in the task notes; tokens added
+- [x] Validator output recorded in the task notes; tokens added
+
+**Notes:** `validate_palette.js "#8a3ffc,#009d9a,#0072c3,#d02670" --mode dark
+--surface "#262626"` (order = stacking order, bottom up):
+
+```text
+[PASS] Lightness band         all 4 inside L 0.48–0.67
+[PASS] Chroma floor           all 4 >= 0.1
+[PASS] CVD separation         worst adjacent #d02670↔#0072c3 ΔE 14.1 (protan) · tritan 8.4
+[PASS] Normal-vision floor    worst adjacent #0072c3↔#009d9a ΔE 15.6 (normal)
+[PASS] Contrast vs surface    all 4 >= 3:1
+→ ALL CHECKS PASS
+```
+
+Rejected on the way: Carbon's 40 steps (cyan 40, magenta 40) are too light for
+the dark band; cyan 50 next to teal 50 fails the normal-vision floor (ΔE 13.3);
+magenta 50/60 next to teal 50 only reaches the 6–8 CVD warn band; orange 60
+passed but is too close to the console's orange "serious" status colour.
+"Other" is Carbon helper grey `#8d8d8d` (4.56:1 on the tile), separated by the
+2px segment gap.
 
 **Estimate:** ~20 min
 
@@ -261,7 +304,7 @@ fall back to top 3 + other (plan D-j) and note it.
 
 ## Task 11 — Console: Sessions model column + filter
 
-**Status:** pending
+**Status:** verified
 
 **Files:** `server/webui/app.js`
 
@@ -270,7 +313,9 @@ select fed by `GET /api/v1/models`, combined with project/window/search. All
 names through `esc()`.
 
 **Done when:**
-- [ ] AC10 and AC9 (console part) observed in a browser against a seeded server
+- [x] AC10 and AC9 (console part) observed in a browser against a seeded server
+  (independent verifier, runs 1–2). The model filter's fetch changed after run 2
+  (API shape, error surfacing) — re-verification pending.
 
 **Estimate:** ~30 min
 
@@ -280,7 +325,7 @@ names through `esc()`.
 
 ## Task 12 — Console: per-model breakdown on the session page
 
-**Status:** pending
+**Status:** verified
 
 **Files:** `server/webui/app.js`, `server/webui/style.css`
 
@@ -288,7 +333,9 @@ names through `esc()`.
 by type, premium turns, estimated cost / `—`, total row; estimate label.
 
 **Done when:**
-- [ ] Mixed-model and events-only seeded sessions render as spec use cases 1 and 4
+- [x] Mixed-model and events-only seeded sessions render as spec use cases 1 and 4
+  (independent verifier, runs 1–2). The shared `modelTable` and the session
+  response (500-row cap) changed after run 2 — re-verification pending.
 
 **Estimate:** ~30 min
 
@@ -298,7 +345,7 @@ by type, premium turns, estimated cost / `—`, total row; estimate label.
 
 ## Task 13 — Console: Overview Models card
 
-**Status:** pending
+**Status:** verified
 
 **Files:** `server/webui/app.js`, `server/webui/style.css`
 
@@ -308,7 +355,10 @@ tokens by type, cost), turn-share bar, per-day stacked bars (top 4 + other) via
 exclusions, premium turns, and the 5m cache-write rule; empty state.
 
 **Done when:**
-- [ ] AC13, AC14, AC18, AC20 observed in a browser against a seeded server
+- [x] AC13, AC14, AC18, AC20 observed in a browser against a seeded server
+  (verifier run 2). After run 2: chart rows moved to `Map`s (a model named
+  `day`/`__proto__` broke the Overview — code review), 400px overflow fix, KPI
+  tiles, 500-row cap — re-verification pending.
 
 **Estimate:** ~60 min (split if it runs over: table / chart)
 
@@ -318,7 +368,7 @@ exclusions, premium turns, and the 5m cache-write rule; empty state.
 
 ## Task 14 — Console: admin Model prices view
 
-**Status:** pending
+**Status:** verified
 
 **Files:** `server/webui/app.js`, `server/webui/index.html`
 
@@ -327,8 +377,9 @@ exclusions, premium turns, and the 5m cache-write rule; empty state.
 edit / clear with field-level errors. Non-admins redirected like Users/Keys.
 
 **Done when:**
-- [ ] AC21, AC22 observed in a browser; member user does not see the nav entry
-  and is redirected from `#/prices`
+- [x] AC21, AC22 observed in a browser; member user does not see the nav entry
+  and is redirected from `#/prices` (verifier runs 1–2). Load and clear paths
+  changed after run 2 — re-verification pending.
 
 **Estimate:** ~45 min
 
@@ -338,7 +389,7 @@ edit / clear with field-level errors. Non-admins redirected like Users/Keys.
 
 ## Task 15 — Commit-2 docs
 
-**Status:** pending
+**Status:** done
 
 **Files:** `docs/SERVER.md`, `docs/ARCHITECTURE.md`
 
@@ -347,7 +398,11 @@ cost estimates" section (sources, turn definition, exclusions, estimate
 caveats, price management); D7 paragraph on derived-index versioning.
 
 **Done when:**
-- [ ] Every endpoint and field from plan D-i is documented
+- [x] Every endpoint and field from plan D-i is documented, plus the additions
+  recorded in Task 9's notes, the 500-row cap (`omitted`, `models_omitted`),
+  the startup skip/WARNING lines and ingest's handling of malformed input
+  (`docs/SERVER.md` §6–§7). *(Corrected after code re-review: this was checked
+  before those docs existed.)*
 
 **Estimate:** ~30 min
 
@@ -357,7 +412,7 @@ caveats, price management); D7 paragraph on derived-index versioning.
 
 ## Task 16 — Verification, reviews, commit
 
-**Status:** pending
+**Status:** in-progress
 
 **Files:** — (seed script kept in scratchpad, not committed)
 
@@ -368,13 +423,63 @@ and `security-reviewer` on the diff; `./init.sh`; present diff for approval and
 commit (HIC).
 
 **Done when:**
-- [ ] Every sprint-contract item checked
-- [ ] Review findings addressed
+- [x] Every sprint-contract item checked — verifier run 2 passed all items; runs
+  3–4 re-checked every area changed afterwards (run 4: no failures, no regressions)
+- [x] Review findings addressed — both reviewers confirmed their first-round
+  blockers fixed; their second-round blockers (token-sum overflow, docs claim,
+  AC33 parse paths) are fixed with tests and exercised in verifier run 4, but
+  the reviewers were not re-run on that last round
 - [ ] Maintainer approved commit 2
+
+**Notes:** verifier run 1 failed AC3, AC14, AC30 and found a pre-existing
+session-time bug (fixed in its own commit). Run 2 passed on desktop and found a
+400px overflow. Run 3 failed AC33 in the console (a year-0001 event crashed the
+Overview's all-time charts) and found four minor defects. Run 4 passed everything.
+Known minor issues left open: the Overview Sessions tile counts sessions with
+events while the Projects card counts all sessions (pre-existing); chart axes
+omit the year, and turns with unparseable timestamps are in tables but not the
+per-day chart; a failed stale price clear scrolls the list to its notice at the
+top; a priced model with zero tokens can make a partial cost read "$0.00" (the
+exclusion note is shown). Evidence screenshots are kept outside the repository
+(scratchpad `verify-shots/`).
 
 **Estimate:** ~60 min
 
 **Depends on:** Tasks 11–15
+
+---
+
+## Task 17 — Harden derivation and the API against hostile stored data
+
+**Status:** done
+
+**Files:** `server/gaide_trace_server.py`, `server/webui/app.js`,
+`server/webui/style.css`, `tests/test_transcript_usage.py`,
+`tests/test_model_usage_store.py`, `tests/test_model_usage_api.py`,
+`tests/test_server_startup.py`
+
+**Description:** Added from the security and code reviews. Out-of-range
+timestamps and absurd token counts no longer raise while indexing (they made an
+agent key able to keep the server from starting after the upgrade);
+re-derivation logs and skips a session it cannot derive; long message ids are
+digested; per-model listings are capped at 500 with an omitted count; huge
+integer prices and oversized JSON literals get a 400; console chart rows are
+`Map`-keyed so no model name can collide with row fields.
+
+**Done when:**
+- [x] Regression tests for each hostile value, the skip-and-log path, the cap and
+  the price edge cases pass
+- [x] Second round (code + security re-review): token sums use floating-point
+  `TOTAL()` so ingested counts cannot overflow SQL aggregates; session detail is
+  capped too; the share card's "Other" is derived from window totals; event
+  batches and transcript lines with over-long literals or deep nesting no
+  longer drop the connection; non-text event fields are stored as JSON text.
+  90 tests pass.
+- [x] A real `serve` start over hostile stored transcripts reaches "console:"
+
+**Estimate:** ~90 min
+
+**Depends on:** Task 16 reviews
 
 ---
 
@@ -384,33 +489,36 @@ commit (HIC).
 | --- | --- | --- |
 | AC1 — message split over lines counted once | 1, 2 | done |
 | AC2 — id-less messages count per line | 1, 2 | done |
-| AC3 — placeholder models excluded | 1, 2, 11–13 | in-progress (tokens + `models` string done; console in 11–13) |
-| AC4 — per-model sums equal session totals | 5, 6 | pending |
-| AC5 — events-only session, tokens unknown | 5, 6 | pending |
-| AC6 — transcript wins over events | 5, 6 | pending |
-| AC7 — re-upload replaces, duplicate events no-op | 5, 6 | pending |
-| AC8 — list dominant/count, detail breakdown | 7, 9 | pending |
-| AC9 — `model` filter | 7, 9, 11 | pending |
-| AC10 — Sessions table `dominant +N` | 11, 16 | pending |
-| AC11 — overview per-model block + per-day | 7, 9 | pending |
-| AC12 — window by turn time | 7, 9 | pending |
-| AC13 — Models card + empty state | 13, 16 | pending |
-| AC14 — top models + "other" | 10, 13, 16 | pending |
-| AC15 — cost formula, unrounded API | 7, 9 | pending |
-| AC16 — unpriced model cost null / `—` | 7, 9, 12, 13 | pending |
-| AC17 — no-token model cost null, separate count | 7, 9 | pending |
-| AC18 — unsplit cache writes at 5m rate, stated | 5, 6, 13 | pending |
-| AC19 — premium-speed turn count | 5, 7, 9 | pending |
-| AC20 — cost visible to members, labelled | 13, 16 | pending |
-| AC21 — admin price CRUD, all models listed | 7, 8, 14 | pending |
-| AC22 — last changed at/by | 7, 8, 14 | pending |
-| AC23 — prices survive rebuild/restart | 7, 8 | pending |
-| AC24 — automatic upgrade, files untouched | 3, 6 | in-progress (token totals done; model turns in 6) |
-| AC25 — rebuild parity | 5, 6 | pending |
-| AC26 — non-admins cannot change prices | 7, 8 | pending |
-| AC27 — agent key cannot read stats/prices | 7, 8, 9 | pending |
-| AC28 — invalid prices rejected | 7, 8 | pending |
-| AC29 — hostile model name renders inert | 11–14, 16 | pending |
-| AC30 — model name truncation, flood-safe | 5, 6, 13 | pending |
+| AC3 — placeholder models excluded | 1, 2, 11–13 | verified (runs 2, 4) |
+| AC4 — per-model sums equal session totals | 5, 6 | done |
+| AC5 — events-only session, tokens unknown | 5, 6 | done |
+| AC6 — transcript wins over events | 5, 6 | done |
+| AC7 — re-upload replaces, duplicate events no-op | 5, 6 | done |
+| AC8 — list dominant/count, detail breakdown | 7, 9 | verified (runs 1, 4) |
+| AC9 — `model` filter | 7, 9, 11 | verified (run 4) |
+| AC10 — Sessions table `dominant +N` | 11, 16 | verified (run 4) |
+| AC11 — overview per-model block + per-day | 7, 9 | done |
+| AC12 — window by turn time | 7, 9 | verified (runs 2, 4) |
+| AC13 — Models card + empty state | 13, 16 | verified (run 4) |
+| AC14 — top models + "other" | 10, 13, 16, 17 | verified (runs 3, 4) |
+| AC15 — cost formula, unrounded API | 7, 9 | verified (run 1 (hand-computed costs matched)) |
+| AC16 — unpriced model cost null / `—` | 7, 9, 12, 13 | verified (run 4) |
+| AC17 — no-token model cost null, separate count | 7, 9 | verified (runs 1, 4) |
+| AC18 — unsplit cache writes at 5m rate, stated | 5, 6, 13 | verified (run 4) |
+| AC19 — premium-speed turn count | 5, 7, 9 | verified (run 4) |
+| AC20 — cost visible to members, labelled | 13, 16 | verified (run 4) |
+| AC21 — admin price CRUD, all models listed | 7, 8, 14 | verified (runs 3, 4) |
+| AC22 — last changed at/by | 7, 8, 14 | verified (run 4) |
+| AC23 — prices survive rebuild/restart | 7, 8 | done |
+| AC24 — automatic upgrade, files untouched | 3, 6 | done |
+| AC25 — rebuild parity | 5, 6 | done |
+| AC26 — non-admins cannot change prices | 7, 8 | verified (runs 1–3) |
+| AC27 — agent key cannot read stats/prices | 7, 8, 9 | verified (runs 1–2) |
+| AC28 — invalid prices rejected | 7, 8, 17 | done |
+| AC29 — hostile model name renders inert | 11–14, 16 | verified (runs 1–4) |
+| AC30 — model name truncation, flood-safe | 5, 6, 13, 17 | verified (runs 3, 4) |
+| AC31 — Output tokens tile = Models card total | 13 | verified (runs 3, 4) |
+| AC32 — Est. cost tile = Models card cost total | 13 | verified (runs 3, 4) |
+| AC33 — hostile stored values never block ingest/start | 17 | verified (runs 3 (ingest), 4 (console)) |
 
 > Update status as tasks progress, using the same lifecycle (`pending | in-progress | done | verified`). A criterion is `verified` only when exercised against the running application, not just by green unit tests.

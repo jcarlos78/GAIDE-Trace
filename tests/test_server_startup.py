@@ -66,6 +66,25 @@ class StartupRederivation(unittest.TestCase):
                       "1 transcripts re-indexed", log)
         self.assertLess(log.index("derived-index schema"), log.index("console:"))
 
+    def test_hostile_stored_transcripts_cannot_keep_the_server_down(self):
+        # What an agent key could have uploaded before this version: values
+        # that used to raise while indexing, now re-parsed on every upgrade.
+        store = server.Store(self.tmp)
+        store.ingest_events([{"trace_id": "t1", "ts": "2026-09-01T10:00:00+00:00",
+                              "event": "prompt.submit", "session_id": "ok"}], "alice")
+        hostile = assistant_lines("claude-opus-5", usage(input_tokens=2**63),
+                                  "0001-01-01T00:00:00+05:00")
+        (self.tmp / "transcripts" / "hostile.jsonl").write_bytes(transcript(hostile))
+        (self.tmp / "transcripts" / "broken.jsonl").write_bytes(b"\xff\xfe" * 1000)
+        with store.connect() as db:
+            db.execute("DELETE FROM meta")
+            db.commit()
+
+        log = startup_log(self.tmp)
+
+        self.assertIn("console:", log)
+        self.assertIn("derived-index schema 0 ->", log)
+
     def test_fresh_install_logs_no_upgrade(self):
         log = startup_log(self.tmp)
         self.assertIn("console:", log)

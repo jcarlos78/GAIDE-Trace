@@ -144,7 +144,10 @@ Per-message counting (defect fix)
   session's input, output, cache-read and cache-write totals.
 - [ ] AC2 — Assistant messages without an `id` contribute once per line.
 - [ ] AC3 — Placeholder models (`<synthetic>`) contribute no turns, tokens or
-  cost, and do not appear as a model anywhere in the console or API.
+  cost, and do not appear as a model anywhere in the console or API. Raw
+  event records (session timeline data, exports) keep the value as captured
+  (D7); the console does not label them as a model. *(Clarified 2026-09-14
+  after the first verification run; accepted by the maintainer.)*
 
 Session model usage
 
@@ -180,8 +183,11 @@ Overview statistics
   indicator, and the per-day chart with a table toggle; with no model data in
   the window it shows an empty state, not an error.
 - [ ] AC14 — With more models than distinct chart series, the chart shows the
-  top models by turns and aggregates the rest into "other"; the table still
-  lists every model.
+  top models by turns **of the current view** (project + window) and
+  aggregates the rest into "other"; the legend lists only models present. The
+  table still lists every model, up to the 500 most used; beyond that the
+  number of omitted models is reported and totals still include them.
+  *(Amended 2026-09-14, maintainer decision: series follow the view; list cap.)*
 
 Cost
 
@@ -232,6 +238,24 @@ Negative (security) criteria
   attribution, so an agent key cannot store unbounded strings through this
   feature; a flood of distinct model names does not break the Overview (AC14
   aggregation still holds).
+
+Overview tiles *(amended 2026-09-14, maintainer decision)*
+
+- [ ] AC31 — The Overview "Output tokens" tile shows the output tokens of the
+  model turns in the project + window — the same figure as the Models card
+  total — with input tokens as its note; `—` when no turn in the window has
+  token data, and a note that it covers only models with token data when some
+  do not.
+- [ ] AC32 — The Overview "Est. cost" tile shows the Models card's cost total,
+  labelled in USD at current prices; its note names how many models are
+  excluded as unpriced and as having no token data.
+
+Robustness against hostile stored data *(added 2026-09-14 after security review)*
+
+- [ ] AC33 — Out-of-range or unparseable timestamps and absurd token counts in
+  ingested events or transcripts never fail an ingest batch, an upload,
+  `rebuild-index`, or server start; a session that still cannot be derived is
+  logged by id and skipped.
 
 ## Out of scope
 

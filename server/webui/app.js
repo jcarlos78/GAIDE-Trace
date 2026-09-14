@@ -13,6 +13,7 @@ const state = {
   token: localStorage.getItem("gt_session") || "",
   filters: { project: "", range: "30" },   // shared by overview + sessions
   sessionsPage: 0,
+  sessionsModel: "",
 };
 
 // ---------------------------------------------------------------- helpers
@@ -135,23 +136,37 @@ function barRect(x, y, w, h, fill) {
    zero, not a missing slot). */
 function fillDays(days) {
   if (days.length < 2) return days;
+  const calendar = calendarDays(days[0].day, days[days.length - 1].day);
+  if (!calendar) return days;
   const byDay = Object.fromEntries(days.map((d) => [d.day, d]));
+  return calendar.map((day) => byDay[day] || { day, prompts: 0, tool_calls: 0 });
+}
+
+// Timestamps are client-supplied; one event dated year 1 would otherwise ask
+// for ~740,000 calendar slots. Past this span the axis shows only days with data.
+const MAX_FILLED_DAYS = 1100;
+
+/* Every UTC day from first to last inclusive, or null when the span is too
+   long to draw day by day. */
+function calendarDays(first, last) {
+  const start = new Date(first + "T00:00:00Z").getTime();
+  const end = new Date(last + "T00:00:00Z").getTime();
+  if (!(end >= start) || (end - start) / 86400e3 > MAX_FILLED_DAYS) return null;
   const out = [];
-  const start = new Date(days[0].day + "T00:00:00Z");
-  const end = new Date(days[days.length - 1].day + "T00:00:00Z");
-  for (let t = start.getTime(); t <= end.getTime(); t += 86400e3) {
-    const day = new Date(t).toISOString().slice(0, 10);
-    out.push(byDay[day] || { day, prompts: 0, tool_calls: 0 });
-  }
+  for (let t = start; t <= end; t += 86400e3) out.push(new Date(t).toISOString().slice(0, 10));
   return out;
 }
+
+// Math.max(...arr) passes every element as an argument and overflows the call
+// stack on long arrays.
+const maxOf = (items, f) => items.reduce((m, x) => Math.max(m, f(x)), 1);
 
 /* Grouped columns per day, two series, hover band + tooltip, table twin. */
 function activityChart(container, days) {
   days = fillDays(days);
   const W = 640, H = 240, padL = 46, padR = 10, padT = 10, padB = 26;
   const plotW = W - padL - padR, plotH = H - padT - padB;
-  const max = niceMax(Math.max(1, ...days.map((d) => Math.max(d.prompts || 0, d.tool_calls || 0))));
+  const max = niceMax(maxOf(days, (d) => Math.max(d.prompts || 0, d.tool_calls || 0)));
   const ticks = [0, max / 2, max].map((t) => Math.round(t));
   const n = Math.max(days.length, 1);
   const band = plotW / n;
@@ -246,6 +261,241 @@ function toolsTable(container, rows) {
     </tbody></table></div>`;
 }
 
+// ---------------------------------------------------------------- models
+
+// Series slots are the current view's top models, as the server ranks them;
+// everything else is "other" grey. Order matches the validated --series-1..4
+// tokens.
+const MODEL_COLORS = ["#8a3ffc", "#009d9a", "#0072c3", "#d02670"];
+// Model names are arbitrary ingested strings ("day", "__proto__", "null"), so
+// per-model counts live in Maps and "other" is a sentinel no string can equal.
+const OTHER = Symbol("other models");
+// Same set as the server's PLACEHOLDER_MODELS: raw event records keep what was
+// captured, but the console never presents these as a model.
+const PLACEHOLDER_MODELS = new Set(["<synthetic>"]);
+const MODELS_TABLE_LIMIT = 50;
+const OTHER_COLOR = "#8d8d8d";
+const modelColor = (model, series) => {
+  const i = (series || []).indexOf(model);
+  return i >= 0 ? MODEL_COLORS[i] : OTHER_COLOR;
+};
+
+function fmtUSD(v) {
+  if (v == null) return "—";
+  if (v > 0 && v < 0.01) return "<$0.01";
+  if (v >= 1e4) return "$" + fmt(v);
+  return "$" + v.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+
+const fmtOrDash = (v) => (v == null ? "—" : fmt(v));
+
+function shortName(name, max = 32) {
+  return name.length > max ? name.slice(0, max - 1) + "…" : name;
+}
+
+function modelCell(model, series) {
+  const swatch = series ? `<span class="swatch" style="background:${modelColor(model, series)}"></span>` : "";
+  return `<span class="model-cell">${swatch}<span class="model-name" title="${esc(model)}">${esc(shortName(model, 48))}</span></span>`;
+}
+
+function cacheWrite(r) {
+  return r.cache_write_5m_tokens == null && r.cache_write_1h_tokens == null
+    ? null : (r.cache_write_5m_tokens || 0) + (r.cache_write_1h_tokens || 0);
+}
+
+function costCell(r) {
+  if (r.cost_status === "unpriced") return `<span title="no price set for this model">—</span>`;
+  if (r.cost_status === "no_tokens") return `<span title="this source records no token usage">—</span>`;
+  const partial = r.turns_without_tokens ? " (partial: some turns have no token data)" : "";
+  return `<span title="${esc(r.cost + " USD" + partial)}">${fmtUSD(r.cost)}${partial ? "*" : ""}</span>`;
+}
+
+/* Every caveat that bounds an estimate is stated, never implied (spec AC16–AC20). */
+function modelNotes(t) {
+  const plural = (n, word) => `${fmt(n)} ${word}${n === 1 ? "" : "s"}`;
+  const notes = ["Estimated cost in USD at the current price table — an estimate, not billing data."];
+  if (t.unpriced_models) {
+    notes.push(`${plural(t.unpriced_models, "model")} without a price ${t.unpriced_models === 1 ? "is" : "are"} excluded from the cost total` +
+      (state.me.role === "admin" ? ` — <a href="#/prices">set prices</a>` : " — an admin can set prices"));
+  }
+  if (t.no_token_models) {
+    notes.push(`${plural(t.no_token_models, "model")} record${t.no_token_models === 1 ? "s" : ""} no token usage (e.g. Antigravity): tokens and cost are unknown, and token totals cover only models with token data`);
+  }
+  if (t.premium_priced_turns) {
+    notes.push(`${plural(t.premium_priced_turns, "turn")} ran at a premium speed and ${t.premium_priced_turns === 1 ? "is" : "are"} priced at standard rates, so the estimate is a lower bound`);
+  }
+  if (t.cache_write_5m_tokens || t.cache_write_1h_tokens) {
+    notes.push("Cache writes without a 5-minute / 1-hour breakdown are priced at the 5-minute rate.");
+  }
+  return `<ul class="notes">${notes.map((n) => `<li>${n}</li>`).join("")}</ul>`;
+}
+
+/* One row per model; `opts.series` adds colour swatches, `opts.overview` the
+   sessions + share columns, `opts.total` a closing total row. */
+function modelTable(rows, opts = {}) {
+  const hidden = opts.limit ? Math.max(0, rows.length - opts.limit) : 0;
+  const shown = hidden ? rows.slice(0, opts.limit) : rows;
+  const tokenCols = (r) => `
+    <td class="num">${fmtOrDash(r.input_tokens)}</td>
+    <td class="num">${fmtOrDash(r.output_tokens)}</td>
+    <td class="num">${fmtOrDash(r.cache_read_tokens)}</td>
+    <td class="num" title="5m ${fmtOrDash(r.cache_write_5m_tokens)} · 1h ${fmtOrDash(r.cache_write_1h_tokens)}">${fmtOrDash(cacheWrite(r))}</td>`;
+  const t = opts.total;
+  return `<div class="table-scroll"><table>
+    <thead><tr><th>Model</th>${opts.overview ? '<th class="num">Sessions</th>' : "<th>Source</th>"}
+      <th class="num">Turns</th>${opts.overview ? '<th class="num">Share</th>' : ""}
+      <th class="num">Input</th><th class="num">Output</th><th class="num">Cache read</th>
+      <th class="num">Cache write</th><th class="num">Est. cost</th></tr></thead>
+    <tbody>${shown.map((r) => `<tr>
+      <td>${modelCell(r.model, opts.series)}</td>
+      ${opts.overview ? `<td class="num">${fmt(r.sessions)}</td>` : `<td>${esc(r.source || "—")}</td>`}
+      <td class="num">${fmt(r.turns)}</td>
+      ${opts.overview ? `<td class="num">${(r.share * 100).toFixed(1)}%</td>` : ""}
+      ${tokenCols(r)}
+      <td class="num">${costCell(r)}</td></tr>`).join("")}
+    ${t && rows.length > 1 ? `<tr class="total"><td>Total</td><td></td>
+      <td class="num">${fmt(t.turns)}</td>${opts.overview ? "<td></td>" : ""}${tokenCols(t)}
+      <td class="num">${fmtUSD(t.cost_total)}</td></tr>` : ""}
+    </tbody></table></div>
+    ${hidden ? `<div class="pager"><span>showing ${fmt(shown.length)} of ${fmt(rows.length)} models — the total covers all of them</span>
+      <button class="btn btn-ghost show-all-models">show all</button></div>` : ""}
+    ${opts.omitted ? `<p class="helper-text" style="margin-top:8px">${fmt(opts.omitted)} less-used model${opts.omitted === 1 ? " is" : "s are"} not listed (the server returns the ${fmt(rows.length)} most used); totals include them.</p>` : ""}`;
+}
+
+/* Stacked columns per day: one segment per series model, then "other". */
+function modelDayRows(perDay, series) {
+  const byDay = new Map();
+  perDay.forEach((d) => {
+    if (!byDay.has(d.day)) byDay.set(d.day, new Map());
+    byDay.get(d.day).set(d.model === null ? OTHER : d.model, d.turns);
+  });
+  let days = [...byDay.keys()].sort();
+  if (days.length > 1) days = calendarDays(days[0], days[days.length - 1]) || days;
+  const keys = perDay.some((d) => d.model === null) ? [...series, OTHER] : [...series];
+  return {
+    keys,
+    days: days.map((day) => {
+      const counts = new Map(keys.map((k) => [k, (byDay.get(day) || new Map()).get(k) || 0]));
+      return { day, counts, total: [...counts.values()].reduce((a, v) => a + v, 0) };
+    }),
+  };
+}
+
+const seriesLabel = (k) => (k === OTHER ? "other models" : k);
+// Chart-made labels ("other models", "total") are set in italics: a model can
+// be *named* "Other models" or "total", but ingested names are always escaped
+// text, so they can never look like these.
+const bucketLabel = (text) => `<em class="bucket">${esc(text)}</em>`;
+const seriesLabelHtml = (k, max = 32) => (k === OTHER ? bucketLabel("other models") : esc(shortName(k, max)));
+
+function modelDayChart(container, perDay, series) {
+  const { keys, days } = modelDayRows(perDay, series);
+  const W = 640, H = 240, padL = 46, padR = 10, padT = 10, padB = 26;
+  const plotW = W - padL - padR, plotH = H - padT - padB;
+  const max = niceMax(maxOf(days, (d) => d.total));
+  const ticks = [0, max / 2, max].map((t) => Math.round(t));
+  const n = Math.max(days.length, 1);
+  const band = plotW / n;
+  const gap = 2;
+  const barW = Math.min(24, Math.max(2, band - gap * 2));
+  const y = (v) => padT + plotH * (1 - v / max);
+
+  let bars = "", bands = "";
+  days.forEach((d, i) => {
+    const x = padL + band * i + (band - barW) / 2;
+    let cum = 0;
+    keys.forEach((k) => {
+      const v = d.counts.get(k);
+      if (!v) return;
+      const top = y(cum + v), bottom = y(cum);
+      // 2px surface gap between stacked segments, taken from the upper one
+      const h = bottom - top - (cum > 0 ? gap : 0);
+      if (h > 0) bars += barRect(x, top, barW, h, modelColor(k, series));
+      cum += v;
+    });
+    bands += `<rect class="hover-band" data-i="${i}" x="${padL + band * i}" y="${padT}"
+               width="${band}" height="${plotH}" fill="transparent"></rect>`;
+  });
+
+  const grid = ticks.map((t) =>
+    `<line x1="${padL}" x2="${W - padR}" y1="${y(t)}" y2="${y(t)}"
+       stroke="${t === 0 ? "var(--baseline)" : "var(--grid)"}" stroke-width="1"></line>
+     <text x="${padL - 8}" y="${y(t) + 4}" text-anchor="end" fill="var(--ink-3)"
+       font-size="10" style="font-variant-numeric:tabular-nums">${fmt(t)}</text>`).join("");
+  const labelEvery = Math.ceil(n / 8);
+  const xlabels = days.map((d, i) => i % labelEvery ? "" :
+    `<text x="${padL + band * i + band / 2}" y="${H - 8}" text-anchor="middle"
+       fill="var(--ink-3)" font-size="10">${esc(d.day.slice(5))}</text>`).join("");
+
+  container.innerHTML = `
+    <div class="legend">${keys.map((k) =>
+      `<span class="key" title="${esc(seriesLabel(k))}"><span class="swatch" style="background:${modelColor(k, series)}"></span>${seriesLabelHtml(k)}</span>`).join("")}
+    </div>
+    <div class="chart-wrap"><svg viewBox="0 0 ${W} ${H}" role="img"
+      aria-label="Model turns per day, stacked by model">${grid}${bars}${xlabels}${bands}</svg></div>`;
+
+  container.querySelectorAll(".hover-band").forEach((b) => {
+    b.addEventListener("mousemove", (e) => {
+      const d = days[Number(b.dataset.i)];
+      showTooltip(`<div class="tt-title">${esc(d.day)}</div>` +
+        keys.filter((k) => d.counts.get(k)).map((k) => `<div class="tt-row">
+          <span class="swatch" style="background:${modelColor(k, series)}"></span>
+          ${seriesLabelHtml(k)}<b>${fmt(d.counts.get(k))}</b></div>`).join("") +
+        `<div class="tt-row tt-total">${bucketLabel("total")}<b>${fmt(d.total)}</b></div>`, e.clientX, e.clientY);
+    });
+    b.addEventListener("mouseleave", hideTooltip);
+  });
+}
+
+function modelDayTable(container, perDay, series) {
+  const { keys, days } = modelDayRows(perDay, series);
+  container.innerHTML = `<div class="table-scroll"><table>
+    <thead><tr><th>Day</th>${keys.map((k) => `<th class="num" title="${esc(seriesLabel(k))}">${seriesLabelHtml(k, 24)}</th>`).join("")}
+      <th class="num">${bucketLabel("total")}</th></tr></thead>
+    <tbody>${days.map((d) => `<tr><td>${esc(d.day)}</td>
+      ${keys.map((k) => `<td class="num">${fmt(d.counts.get(k))}</td>`).join("")}
+      <td class="num">${fmt(d.total)}</td></tr>`).join("")}</tbody></table></div>`;
+}
+
+/* Share of turns: the chart's series plus one "other" segment, same colours. */
+function modelShareCard(m) {
+  const card = document.createElement("div");
+  card.className = "card";
+  const inSeries = m.rows.filter((r) => m.series.includes(r.model));
+  // "Other" is derived from the window totals, not from the listed rows: the
+  // server caps the listing, and the omitted models belong in this bucket.
+  const otherCount = m.rows.length - inSeries.length + (m.models_omitted || 0);
+  const otherTurns = m.turns - inSeries.reduce((a, r) => a + r.turns, 0);
+  const segments = inSeries.map((r) => ({
+    label: r.model, html: esc(shortName(r.model, 40)), key: r.model, turns: r.turns, share: r.share,
+  }));
+  if (otherCount > 0) {
+    const label = `other models (${fmt(otherCount)})`;
+    segments.push({ label, html: bucketLabel(label), key: OTHER,
+                    turns: otherTurns, share: otherTurns / m.turns });
+  }
+  card.innerHTML = `<div class="card-head"><span class="card-title">Model share — turns</span></div>
+    <div class="share-bar" role="img" aria-label="Share of model turns">${segments.map((s, i) =>
+      `<span data-i="${i}" style="flex:${s.share} 1 0;background:${modelColor(s.key, m.series)}"></span>`).join("")}</div>
+    <div class="table-scroll"><table>
+      <thead><tr><th>Model</th><th class="num">Turns</th><th class="num">Share</th></tr></thead>
+      <tbody>${segments.map((s) => `<tr>
+        <td><span class="model-cell"><span class="swatch" style="background:${modelColor(s.key, m.series)}"></span>
+          <span class="model-name" title="${esc(s.label)}">${s.html}</span></span></td>
+        <td class="num">${fmt(s.turns)}</td>
+        <td class="num">${(s.share * 100).toFixed(1)}%</td></tr>`).join("")}</tbody></table></div>`;
+  card.querySelectorAll(".share-bar span").forEach((el) => {
+    el.addEventListener("mousemove", (e) => {
+      const s = segments[Number(el.dataset.i)];
+      showTooltip(`<div class="tt-title">${s.key === OTHER ? s.html : esc(s.label)}</div>
+        <div class="tt-row">turns<b>${fmt(s.turns)}</b></div>
+        <div class="tt-row">share<b>${(s.share * 100).toFixed(1)}%</b></div>`, e.clientX, e.clientY);
+    });
+    el.addEventListener("mouseleave", hideTooltip);
+  });
+  return card;
+}
+
 /* Wire a chart card's chart/table toggle. */
 function chartCard(title, renderChart, renderTable) {
   const card = document.createElement("div");
@@ -318,13 +568,16 @@ async function viewOverview() {
     ["Prompts", t.prompts, ""],
     ["Tool calls", t.tool_calls, ""],
     ["Tool failures", t.failures, failNote, t.failures > 0],
-    ["Output tokens", t.output_tokens, t.input_tokens != null ? fmt(t.input_tokens) + " input" : ""],
+    // Token and cost tiles use the Models card's turn-time totals, so the two
+    // never disagree about the same window.
+    ["Output tokens", o.models.output_tokens, tokenKpiNote(o.models), false, fmtOrDash],
+    ["Est. cost", o.models.cost_total, costKpiNote(o.models), false, fmtUSD],
   ];
   const kpiRow = document.createElement("div");
   kpiRow.className = "kpi-row";
-  kpiRow.innerHTML = kpis.map(([label, v, note, bad]) => `
+  kpiRow.innerHTML = kpis.map(([label, v, note, bad, format]) => `
     <div class="card kpi"><span class="microlabel">${label}</span>
-      <div class="kpi-value">${fmt(v || 0)}</div>
+      <div class="kpi-value">${format ? format(v) : fmt(v || 0)}</div>
       <div class="kpi-note${bad ? " bad" : ""}">${esc(note || "")}</div></div>`).join("");
   main.appendChild(kpiRow);
 
@@ -346,6 +599,29 @@ async function viewOverview() {
       connect a project with <code>install.sh --server</code> and start a session</div></div>`);
   }
 
+  const m = o.models;
+  if (m.rows.length) {
+    const modelGrid = document.createElement("div");
+    modelGrid.className = "grid-2";
+    modelGrid.appendChild(chartCard("Model turns — per day",
+      (el) => modelDayChart(el, m.per_day, m.series), (el) => modelDayTable(el, m.per_day, m.series)));
+    modelGrid.appendChild(modelShareCard(m));
+    main.appendChild(modelGrid);
+  }
+  const modelsCard = document.createElement("div");
+  modelsCard.className = "card";
+  const renderModels = (limit) => {
+    modelsCard.innerHTML = `<div class="card-head"><span class="card-title">Models — tokens and estimated cost</span></div>` +
+      (m.rows.length
+        ? modelTable(m.rows, { series: m.series, overview: true, total: m, limit,
+                               omitted: m.models_omitted }) + modelNotes(m)
+        : `<div class="empty"><span class="glyph">∴</span>no model turns in this window</div>`);
+    const more = $(".show-all-models", modelsCard);
+    if (more) more.addEventListener("click", () => renderModels(0));
+  };
+  renderModels(MODELS_TABLE_LIMIT);
+  main.appendChild(modelsCard);
+
   const twoCol = document.createElement("div");
   twoCol.className = "grid-2";
   twoCol.appendChild(breakdownCard("Projects", o.projects, "project"));
@@ -354,6 +630,19 @@ async function viewOverview() {
 
   const last = o.projects.map((p) => p.last_ts).sort().pop();
   $("#last-signal").textContent = last ? "last event " + timeAgo(last) : "";
+}
+
+function tokenKpiNote(m) {
+  if (m.output_tokens == null) return m.rows.length ? "no token data in this window" : "";
+  const input = fmt(m.input_tokens) + " input";
+  return m.no_token_models ? `${input} · models with token data only` : input;
+}
+
+function costKpiNote(m) {
+  const parts = [];
+  if (m.unpriced_models) parts.push(`${m.unpriced_models} unpriced`);
+  if (m.no_token_models) parts.push(`${m.no_token_models} without token data`);
+  return parts.length ? `excludes models: ${parts.join(", ")}` : "USD at current prices";
 }
 
 function breakdownCard(title, rows, keyField) {
@@ -376,10 +665,31 @@ function breakdownCard(title, rows, keyField) {
 
 async function viewSessions() {
   main.innerHTML = "";
+  let models = [], modelsError = "";
+  try {
+    models = (await apiJSON("/api/v1/models")).models.filter((m) => m.turns > 0);
+  } catch (err) {
+    if (err.message === "unauthorized") throw err;
+    modelsError = err.message;
+  }
+  // A remembered filter for a model no longer listed would filter rows while
+  // the select claims "all models".
+  if (!models.some((m) => m.model === state.sessionsModel)) state.sessionsModel = "";
   const extra = `
+    <div class="field"><label class="microlabel">Model${modelsError
+      ? ` <span class="row-error" title="${esc(modelsError)}">· list unavailable</span>` : ""}</label>
+      <select id="f-model"><option value="">all models</option>
+        ${models.map((m, i) => `<option value="${i}" ${m.model === state.sessionsModel ? "selected" : ""}
+          title="${esc(m.model)}">${esc(shortName(m.model, 64))}</option>`).join("")}
+      </select></div>
     <div class="field"><label class="microlabel">Session id</label>
       <input id="f-q" placeholder="search…" value=""></div>`;
   main.appendChild(await filtersRow(() => { state.sessionsPage = 0; loadSessions(); }, extra));
+  $("#f-model").addEventListener("change", (e) => {
+    state.sessionsModel = e.target.value === "" ? "" : models[Number(e.target.value)].model;
+    state.sessionsPage = 0;
+    loadSessions();
+  });
   const holder = document.createElement("div");
   holder.className = "card";
   main.appendChild(holder);
@@ -395,6 +705,7 @@ async function viewSessions() {
       project: state.filters.project,
       from: rangeFrom(state.filters.range),
       q: ($("#f-q") || {}).value || "",
+      model: state.sessionsModel,
       limit, offset: state.sessionsPage * limit,
     };
     const data = await apiJSON("/api/v1/sessions" + qs(params));
@@ -403,13 +714,17 @@ async function viewSessions() {
       return;
     }
     holder.innerHTML = `<div class="table-scroll"><table>
-      <thead><tr><th>Session</th><th>Project</th><th>Member</th><th>Last active</th>
+      <thead><tr><th>Session</th><th>Project</th><th>Member</th><th>Model</th><th>Last active</th>
         <th class="num">Prompts</th><th class="num">Tools</th><th class="num">Fail</th>
         <th class="num">Out tokens</th><th>Transcript</th></tr></thead>
       <tbody>${data.sessions.map((s) => `<tr class="click" data-sid="${esc(s.session_id)}">
         <td><span class="mono-id">${esc(s.session_id.slice(0, 8))}…</span></td>
         <td>${esc(s.project || "—")}</td>
         <td>${esc(s.origin || "—")}</td>
+        <td>${s.dominant_model
+          ? `<span class="model-name" title="${esc(s.dominant_model)}">${esc(shortName(s.dominant_model))}</span>` +
+            (s.model_count > 1 ? `<span class="badge plus-n" title="${s.model_count - 1} other model${s.model_count === 2 ? "" : "s"} in this session">+${s.model_count - 1}</span>` : "")
+          : "—"}</td>
         <td>${fmtTime(s.last_ts)}</td>
         <td class="num">${fmt(s.prompts)}</td>
         <td class="num">${fmt(s.tool_calls)}</td>
@@ -440,6 +755,7 @@ const LEGACY_EVENTS = {
   PreCompact: "context.compact", SessionEnd: "session.end",
 };
 const canonEvent = (ev) => LEGACY_EVENTS[ev] || ev;
+const shownModel = (model) => model && !PLACEHOLDER_MODELS.has(model);
 
 const EVENT_GLYPHS = {
   "session.start": ["▶", "", "session start"],
@@ -477,7 +793,7 @@ async function viewSession(sid) {
         <div><span class="microlabel">Failures</span><span class="val">${fmt(s.failures)}</span></div>
         <div><span class="microlabel">Tokens in / out</span>
           <span class="val">${fmt(s.input_tokens)} / ${fmt(s.output_tokens)}</span></div>
-        ${s.models ? `<div><span class="microlabel">Models</span><span class="val">${esc(s.models)}</span></div>` : ""}
+        ${s.dominant_model ? `<div><span class="microlabel">Model</span><span class="val" title="${esc(s.dominant_model)}">${esc(shortName(s.dominant_model, 48))}${s.model_count > 1 ? ` <span class="badge plus-n">+${s.model_count - 1}</span>` : ""}</span></div>` : ""}
       </div>
     </div>
     <div class="form-actions">
@@ -494,6 +810,15 @@ async function viewSession(sid) {
     download(`/api/v1/export${qs({ session: sid, format: "jsonl" })}`));
   $("#dl-events-csv").addEventListener("click", () =>
     download(`/api/v1/export${qs({ session: sid, format: "csv" })}`));
+
+  if (data.models.length) {
+    const usage = document.createElement("div");
+    usage.className = "card";
+    usage.innerHTML = `<div class="card-head"><span class="card-title">Model usage</span></div>` +
+      modelTable(data.models, { total: data.models_total, omitted: data.models_omitted }) +
+      modelNotes(data.models_total);
+    main.appendChild(usage);
+  }
 
   const tl = document.createElement("div");
   tl.className = "timeline";
@@ -518,14 +843,14 @@ async function viewSession(sid) {
           ${e.tool_response ? `<span class="microlabel">response</span><pre>${esc(e.tool_response)}</pre>` : ""}
         </div></div>`;
     } else if (ev === "turn.end" || ev === "agent.end" || ev === "model.turn" || ev === "note") {
-      const label = tag + (e.model ? " · " + esc(e.model) : "");
+      const label = tag + (shownModel(e.model) ? ` · <span title="${esc(e.model)}">${esc(shortName(e.model, 64))}</span>` : "");
       body = e.last_assistant_message
         ? `<div class="tl-card stop"><div class="tl-tag">${label}${e.agent_type ? " · " + esc(e.agent_type) : ""}</div>
            <div class="tl-text">${esc(e.last_assistant_message)}</div></div>`
         : `<div class="tl-tag" style="padding:8px 0">${label}${ev === "model.turn" && e.tool_name ? " · → " + esc(e.tool_name) : ""}</div>`;
     } else {
       body = `<div class="tl-tag" style="padding:8px 0">${esc(tag)}
-        ${e.model ? `· ${esc(e.model)}` : ""}</div>`;
+        ${shownModel(e.model) ? `· <span title="${esc(e.model)}">${esc(shortName(e.model, 64))}</span>` : ""}</div>`;
     }
     return `<div class="tl-item">
       <div class="tl-time">${fmtTime(e.ts).split(", ")[1] || fmtTime(e.ts)}</div>
@@ -785,6 +1110,117 @@ async function viewProjects() {
   await loadProjects();
 }
 
+// ---------------------------------------------------------------- model prices
+
+const PRICE_FIELDS = [
+  ["input", "Input"], ["output", "Output"], ["cache_read", "Cache read"],
+  ["cache_write_5m", "Cache write 5m"], ["cache_write_1h", "Cache write 1h"],
+];
+
+async function viewPrices() {
+  if (state.me.role !== "admin") { location.hash = "#/overview"; return; }
+  main.innerHTML = "";
+  const card = document.createElement("div");
+  card.className = "card";
+  main.appendChild(card);
+
+  const priceInputs = (price) => PRICE_FIELDS.map(([f, label]) =>
+    `<td class="num"><input class="price-input" type="number" min="0" step="any"
+       data-field="${f}" aria-label="${label} USD per million tokens"
+       value="${price && price[f] != null ? price[f] : ""}"></td>`).join("");
+
+  async function save(model, row) {
+    const body = { model };
+    row.querySelectorAll("input[data-field]").forEach((el) => {
+      body[el.dataset.field] = el.value === "" ? null : Number(el.value);
+    });
+    try {
+      await apiJSON("/api/v1/models/prices", { method: "PUT", body: JSON.stringify(body) });
+      load();
+    } catch (err) {
+      const errEl = row.querySelector(".row-error") || card.querySelector(".add-error");
+      errEl.textContent = err.message;
+    }
+  }
+
+  async function load(notice = "") {
+    const { models, omitted } = await apiJSON("/api/v1/models");
+    card.innerHTML = `
+      <div class="card-head"><span class="card-title">Model prices</span></div>
+      ${notice ? `<p class="row-error pr-notice" role="alert">${esc(notice)}</p>` : ""}
+      ${omitted ? `<p class="helper-text">${fmt(omitted)} less-used model${omitted === 1 ? " is" : "s are"} not listed;
+        use the row at the bottom to price one by name.</p>` : ""}
+      <p class="helper-text" style="margin-bottom:16px">USD per million tokens, per
+        token type. Used only for the cost estimates in this console and never
+        fetched from a provider — keep them in step with your contract. Models
+        without a price show no cost rather than a guess.</p>
+      <div class="table-scroll"><table>
+        <thead><tr><th>Model</th><th class="num">Turns</th><th>Last used</th>
+          ${PRICE_FIELDS.map(([, label]) => `<th class="num">${label}</th>`).join("")}
+          <th>Last changed</th><th></th></tr></thead>
+        <tbody>
+          ${models.map((m, i) => `<tr data-i="${i}">
+            <td>${modelCell(m.model)}</td>
+            <td class="num">${fmt(m.turns)}</td>
+            <td>${m.last_ts ? timeAgo(m.last_ts) : "not seen yet"}</td>
+            ${PRICE_FIELDS.map(([f]) => `<td class="num">${m.price ? "$" + m.price[f] : ""}</td>`).join("")}
+            <td>${m.price ? `${timeAgo(m.price.updated_at)} · ${esc(m.price.updated_by || "—")}`
+                          : '<span class="badge">unpriced</span>'}</td>
+            <td><div class="actions">
+              <button class="btn btn-ghost pr-edit">${m.price ? "edit" : "set price"}</button>
+              ${m.price ? '<button class="btn btn-ghost btn-danger pr-clear">clear</button>' : ""}
+            </div></td></tr>`).join("") ||
+            `<tr><td colspan="10" class="empty">no models seen yet</td></tr>`}
+          <tr class="pr-add">
+            <td><input class="price-model-input" placeholder="model not seen yet" spellcheck="false"
+                 maxlength="128" aria-label="Model name"></td>
+            <td></td><td></td>${priceInputs(null)}<td></td>
+            <td><div class="actions"><button class="btn btn-ghost pr-add-save">add price</button></div></td>
+          </tr>
+          <tr><td colspan="10" class="row-error add-error"></td></tr>
+        </tbody></table></div>`;
+
+    card.querySelectorAll("tr[data-i]").forEach((row) => {
+      const m = models[Number(row.dataset.i)];
+      row.querySelector(".pr-edit").addEventListener("click", () => {
+        row.innerHTML = `<td>${modelCell(m.model)}</td><td class="num">${fmt(m.turns)}</td>
+          <td>${m.last_ts ? timeAgo(m.last_ts) : "not seen yet"}</td>${priceInputs(m.price)}
+          <td class="row-error"></td>
+          <td><div class="actions"><button class="btn btn-accent pr-save">save</button>
+            <button class="btn btn-ghost pr-cancel">cancel</button></div></td>`;
+        row.querySelector("input").focus();
+        row.querySelector(".pr-save").addEventListener("click", () => save(m.model, row));
+        row.querySelector(".pr-cancel").addEventListener("click", () => load());
+        row.querySelectorAll("input").forEach((el) => el.addEventListener("keydown", (e) => {
+          if (e.key === "Enter") save(m.model, row);
+          if (e.key === "Escape") load();
+        }));
+      });
+      const clear = row.querySelector(".pr-clear");
+      if (clear) {
+        clear.addEventListener("click", async () => {
+          if (!confirm("Clear this model's price? Its cost will show as unpriced.")) return;
+          try {
+            await api("/api/v1/models/prices" + qs({ model: m.model }), { method: "DELETE" });
+            load();
+          } catch (err) {
+            if (err.message === "unauthorized") return;
+            // The row is probably stale (changed elsewhere): refresh the list
+            // and put the message where the admin is looking.
+            await load(`Could not clear the price of ${m.model}: ${err.message}. The list has been refreshed.`);
+            card.querySelector(".pr-notice").scrollIntoView({ block: "center" });
+          }
+        });
+      }
+    });
+    const addRow = card.querySelector(".pr-add");
+    card.querySelector(".pr-add-save").addEventListener("click", () =>
+      save(addRow.querySelector(".price-model-input").value.trim(), addRow));
+  }
+
+  await load();
+}
+
 // ---------------------------------------------------------------- users
 
 async function viewUsers() {
@@ -874,7 +1310,7 @@ async function viewUsers() {
 // ---------------------------------------------------------------- router / auth
 
 const VIEWS = { overview: viewOverview, sessions: viewSessions, projects: viewProjects,
-                export: viewExport, users: viewUsers, keys: viewKeys };
+                export: viewExport, users: viewUsers, keys: viewKeys, prices: viewPrices };
 
 async function route() {
   if (!state.me) return;
@@ -925,6 +1361,7 @@ function enterShell(me) {
   $("#server-version").textContent = "v" + me.version;
   $("#nav-keys").classList.toggle("hidden", me.role !== "admin");
   $("#nav-users").classList.toggle("hidden", me.role !== "admin");
+  $("#nav-prices").classList.toggle("hidden", me.role !== "admin");
   route();
 }
 

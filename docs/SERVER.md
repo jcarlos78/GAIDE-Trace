@@ -43,6 +43,8 @@ anything else works. From there, everything is managed visually:
 - **Projects** — register a project; the server generates an ingest-only key
   and a ready-to-paste **install prompt** (see §2).
 - **API keys** — advanced: raw bearer keys for scripts/CI.
+- **Model prices** — per-model USD prices behind the console's cost estimates
+  (see §7).
 
 Locked out? Reset any account from the server shell:
 
@@ -205,11 +207,20 @@ If `trace.db` is ever lost or corrupted, `rebuild-index` reconstructs it from
 the JSONL archive.
 
 **Upgrades re-derive the index on their own.** When a release changes how
-index data is derived from the stored transcripts, the server re-derives
-existing data on its first start, before it accepts connections, and logs one
-line (`derived-index schema N -> M: ...`, plus progress lines on long runs;
+index data is derived (from the stored transcripts and the indexed events),
+the server re-derives existing data on its first start, before it accepts
+connections, and logs one line (`derived-index schema N -> M: ...`, plus progress lines on long runs;
 a 50 MB transcript takes well under a second). The archive
 and transcript files are never modified; no manual `rebuild-index` is needed.
+A session whose stored data cannot be derived is logged by id
+(`re-deriving index: skipped session ...`) and skipped, followed by a
+`WARNING: N sessions could not be re-derived` line — the server still starts.
+Such a session re-derives on its next transcript upload or `rebuild-index`.
+
+Ingest tolerates hostile or malformed input without losing the rest of a
+batch: unparseable request bodies get a 400, transcript lines that cannot be
+parsed are skipped, out-of-range timestamps are indexed without a time, and
+non-text field values in an event are stored as JSON text.
 
 **Token totals drop after upgrading past v0.3.1 — that is a correction.**
 Claude Code writes each assistant message to its transcript as one line per
@@ -239,9 +250,12 @@ the login endpoint).
 | `POST /api/v1/auth/logout` | member | revoke the session |
 | `POST /api/v1/events` | agent | ingest a JSON array of event records (idempotent by `trace_id`; gzip body supported) |
 | `PUT /api/v1/transcripts/<session_id>?project=` | agent | store/replace a transcript snapshot (gzip supported) |
-| `GET /api/v1/overview?project&from&to` | member | aggregates: totals, per-day series, top tools, per-project/member |
-| `GET /api/v1/sessions?project&origin&from&to&q&limit&offset` | member | session list |
-| `GET /api/v1/sessions/<id>` | member | session meta + full event timeline |
+| `GET /api/v1/overview?project&from&to` | member | aggregates: totals, per-day series, top tools, per-project/member, and `models` (see below) |
+| `GET /api/v1/sessions?project&origin&model&from&to&q&limit&offset` | member | session list; each row carries `dominant_model` and `model_count`; `model` keeps sessions where that model has at least one turn |
+| `GET /api/v1/sessions/<id>` | member | session meta + full event timeline + `models` (per-model rows) and `models_total` |
+| `GET /api/v1/models` | member | `{models, omitted}`: the 500 most-used models seen (turns, sessions, last use) plus every priced model, each with its `price` or `null`; `omitted` counts seen models beyond the 500 |
+| `PUT /api/v1/models/prices` | admin | set a price: `{model, input, output, cache_read, cache_write_5m, cache_write_1h}` in USD per million tokens, each 0–10000 |
+| `DELETE /api/v1/models/prices?model=` | admin | clear a model's price |
 | `GET /api/v1/sessions/<id>/transcript` | member | raw transcript download |
 | `GET /api/v1/export?format=jsonl\|csv&project&session&origin&event&from&to` | member | filtered event export |
 | `GET /api/v1/projects/manage`, `POST /api/v1/projects`, `POST .../<id>/rotate` | member | registered projects + install-prompt keys |
@@ -253,6 +267,56 @@ the login endpoint).
 The export format is the same schema as the local store
 (`schema/event.schema.json`) plus `origin` (key name) and `received_at` —
 `analysis/load_trace.py` loads server exports unchanged.
+
+### Model usage and cost estimates
+
+The server attributes every **model turn** to the model that produced it:
+
+- **Claude Code** — one distinct assistant message in the transcript snapshot
+  (by `message.id`). Hook events carry no model, so a Claude Code session has
+  model data once its transcript has been uploaded.
+- **Antigravity** (and any adapter emitting it) — one `model.turn` event with
+  a `model`. These sources record no token usage: tokens and cost are
+  reported as unknown (`null`), never as zero.
+
+A session's turns come from its transcript when that yields any, otherwise
+from its `model.turn` events — never both. Claude Code's `<synthetic>`
+placeholder is never counted as a model. Model names are truncated to 128
+characters.
+
+Per-model rows (`models` on a session, `models.rows` on the overview) carry
+`turns`, `turns_without_tokens`, `input_tokens`, `output_tokens`,
+`cache_read_tokens`, `cache_write_5m_tokens`, `cache_write_1h_tokens`,
+`premium_turns`, `cost` and `cost_status`; overview rows add `sessions` and
+`share` of turns. Totals add `cost_total`, `unpriced_models`,
+`no_token_models`, `premium_turns` and `premium_priced_turns`. The overview
+window applies to each turn's own timestamp, so a session crossing the window
+edge contributes only its turns inside it. `models.per_day` gives turns per
+UTC day for the view's top four models (named in `models.series`), with every
+other model folded into `model: null`.
+
+Per-model listings are capped at the 500 most-used models — `models.rows` on
+the overview, `models` on a session — with the rest counted in
+`models_omitted`; totals, shares and cost always cover every model. The cap
+keeps a flood of distinct model names from an ingest key out of members'
+browsers. Token sums are computed in floating point, so they cannot overflow
+however large the ingested counts; a single turn's count above 10¹² is treated
+as invalid and counted as 0.
+
+**Cost is an estimate, not billing data.** Admins maintain a price per model on
+the console's **Model prices** page; the server never fetches prices from a
+provider. Cost = Σ tokens of each type × that type's price ÷ 1,000,000, at the
+prices current when you look (no price history), returned unrounded.
+
+- `cost_status: "unpriced"` — no price entry: `cost` is `null` and the model is
+  excluded from `cost_total`, never guessed.
+- `cost_status: "no_tokens"` — the source records no usage (e.g. Antigravity).
+- Turns whose usage reports a non-standard `speed` (fast mode) are priced at
+  standard rates; `premium_priced_turns` > 0 means the total is a lower bound.
+- Cache writes without a 5-minute / 1-hour breakdown are priced at the
+  5-minute rate.
+
+Prices are configuration, like users and keys: `rebuild-index` keeps them.
 
 ## 8. Security notes
 

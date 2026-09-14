@@ -124,6 +124,15 @@ queries and aggregates. The index is derived data: `rebuild-index`
 reconstructs it from the archive, and file-level backups of the data
 directory are sufficient and consistent.
 
+The rules that derive the index are versioned (`DERIVED_VERSION`, stored in the
+index's `meta` table). When a release changes them — e.g. counting transcript
+usage once per message, or attributing turns to models — `serve` re-derives
+existing data from the stored transcripts and indexed events on its first
+start, before accepting connections. The archive and transcript files are
+never modified, so upgrades need no manual `rebuild-index` and D7 holds.
+Configuration stored in SQLite alongside the index (users, keys, projects,
+model prices) is not derived data and survives both paths.
+
 ### D8 — Zero dependencies on the server too
 
 The server is Python stdlib only (`http.server`, `sqlite3`), one process,
