@@ -10,6 +10,28 @@
 set -euxo pipefail
 exec >>/var/log/gaide-trace-bootstrap.log 2>&1
 
+# --- Egress ------------------------------------------------------------------
+# The subnet hands out no public IP; egress starts when Terraform attaches the
+# Elastic IP, seconds after boot. IMDS reports public-ipv4 exactly then. Its
+# session token stays out of the xtrace log.
+has_public_ip() {
+  { set +x; } 2>/dev/null
+  local token
+  token="$(curl -fsS -X PUT http://169.254.169.254/latest/api/token \
+    -H 'X-aws-ec2-metadata-token-ttl-seconds: 60')" || { set -x; return 1; }
+  curl -fsS -o /dev/null -H "X-aws-ec2-metadata-token: $${token}" \
+    http://169.254.169.254/latest/meta-data/public-ipv4
+  local rc=$?
+  set -x
+  return "$${rc}"
+}
+
+for _ in $(seq 1 100); do
+  has_public_ip && break
+  sleep 3
+done
+has_public_ip
+
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -y
 apt-get install -y git curl ca-certificates debian-keyring debian-archive-keyring apt-transport-https
