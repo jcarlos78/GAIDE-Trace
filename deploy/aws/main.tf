@@ -72,11 +72,14 @@ resource "aws_internet_gateway" "this" {
   tags   = { Name = local.prefix }
 }
 
+# No auto-assigned public IP: the server's only public address is the Elastic
+# IP below, the one DNS points at. Until it is attached the instance has no
+# egress, which is why user_data waits for it before touching the network.
 resource "aws_subnet" "public" {
   vpc_id                  = aws_vpc.this.id
   cidr_block              = "10.42.1.0/24"
   availability_zone       = local.az
-  map_public_ip_on_launch = true
+  map_public_ip_on_launch = false
 
   tags = { Name = "${local.prefix}-public" }
 }
