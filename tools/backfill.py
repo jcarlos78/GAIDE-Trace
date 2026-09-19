@@ -21,10 +21,21 @@ import gzip
 import json
 import os
 import sys
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
 BATCH = 500
+
+# --server may come from config.json or env, so it is not trusted to be a web
+# URL. Unlike urlopen's default opener, this one has no file://, ftp:// or
+# data: handlers — same guard as hooks/trace_hook.py.
+_OPENER = urllib.request.OpenerDirector()
+for _handler in (urllib.request.ProxyHandler(), urllib.request.UnknownHandler(),
+                 urllib.request.HTTPHandler(), urllib.request.HTTPSHandler(),
+                 urllib.request.HTTPDefaultErrorHandler(),
+                 urllib.request.HTTPErrorProcessor()):
+    _OPENER.add_handler(_handler)
 
 
 def post(url, token, data, method="POST", gzipped=False):
@@ -33,7 +44,7 @@ def post(url, token, data, method="POST", gzipped=False):
     if gzipped:
         headers["Content-Encoding"] = "gzip"
     req = urllib.request.Request(url, data=data, method=method, headers=headers)
-    with urllib.request.urlopen(req, timeout=60) as resp:
+    with _OPENER.open(req, timeout=60) as resp:
         return json.loads(resp.read() or b"{}")
 
 
@@ -58,6 +69,8 @@ def main():
     if not (server and token):
         sys.exit("error: need --server and --token (or config.json / env vars)")
     server = server.rstrip("/")
+    if urllib.parse.urlsplit(server).scheme not in ("http", "https"):
+        sys.exit(f"error: server URL must be http(s): {server!r}")
     project = args.project or store.resolve().parent.name
 
     # ---- events ----

@@ -44,6 +44,7 @@ import re
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from datetime import datetime, timezone
@@ -124,13 +125,27 @@ def server_config(cfg: dict):
     return None
 
 
+# The server URL comes from env/config.json, so it is not trusted to be a web
+# URL. urlopen's default opener also handles file://, ftp:// and data:, so a
+# crafted "server" would make the hook read local files instead of talking to
+# a server. This opener has only the HTTP(S) handlers: other schemes fail.
+_OPENER = urllib.request.OpenerDirector()
+for _handler in (urllib.request.ProxyHandler(), urllib.request.UnknownHandler(),
+                 urllib.request.HTTPHandler(), urllib.request.HTTPSHandler(),
+                 urllib.request.HTTPDefaultErrorHandler(),
+                 urllib.request.HTTPErrorProcessor()):
+    _OPENER.add_handler(_handler)
+
+
 def http(url: str, token: str, data: bytes, method="POST",
          content_type="application/json", timeout=5.0, gzipped=False):
+    if urllib.parse.urlsplit(url).scheme not in ("http", "https"):
+        raise ValueError(f"server URL must be http(s): {url!r}")
     headers = {"Authorization": f"Bearer {token}", "Content-Type": content_type}
     if gzipped:
         headers["Content-Encoding"] = "gzip"
     req = urllib.request.Request(url, data=data, method=method, headers=headers)
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
+    with _OPENER.open(req, timeout=timeout) as resp:
         return 200 <= resp.status < 300
 
 
