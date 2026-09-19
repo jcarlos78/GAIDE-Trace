@@ -63,15 +63,18 @@ function qs(params) {
 }
 
 async function api(path, opts) {
+  // keepSession: on a 401, throw without signing out, for a caller that must
+  // first show what it did (the price import's per-row results).
+  const { keepSession, ...fetchOpts } = opts || {};
   const res = await fetch(path, {
-    ...opts,
+    ...fetchOpts,
     headers: {
       Authorization: "Bearer " + state.token,
-      ...(opts && opts.body ? { "Content-Type": "application/json" } : {}),
-      ...(opts && opts.headers),
+      ...(fetchOpts.body ? { "Content-Type": "application/json" } : {}),
+      ...fetchOpts.headers,
     },
   });
-  if (res.status === 401) { logout(); throw new Error("unauthorized"); }
+  if (res.status === 401) { if (!keepSession) logout(); throw new Error("unauthorized"); }
   if (!res.ok) {
     let msg = res.statusText;
     try { msg = (await res.json()).error || msg; } catch (e) { /* keep statusText */ }
@@ -1120,6 +1123,9 @@ const PRICE_FIELDS = [
 async function viewPrices() {
   if (state.me.role !== "admin") { location.hash = "#/overview"; return; }
   main.innerHTML = "";
+  let pageModels = [];
+  const importCard = priceImportCard(() => pageModels, () => load());
+  main.appendChild(importCard);
   const card = document.createElement("div");
   card.className = "card";
   main.appendChild(card);
@@ -1145,15 +1151,18 @@ async function viewPrices() {
 
   async function load(notice = "") {
     const { models, omitted } = await apiJSON("/api/v1/models");
+    pageModels = models;
+    importCard.refresh();
     card.innerHTML = `
       <div class="card-head"><span class="card-title">Model prices</span></div>
       ${notice ? `<p class="row-error pr-notice" role="alert">${esc(notice)}</p>` : ""}
       ${omitted ? `<p class="helper-text">${fmt(omitted)} less-used model${omitted === 1 ? " is" : "s are"} not listed;
         use the row at the bottom to price one by name.</p>` : ""}
       <p class="helper-text" style="margin-bottom:16px">USD per million tokens, per
-        token type. Used only for the cost estimates in this console and never
-        fetched from a provider — keep them in step with your contract. Models
-        without a price show no cost rather than a guess.</p>
+        token type. Used only for the cost estimates in this console. Set them by
+        hand, or load input and output list prices from benchlm.ai above and
+        review them before applying — keep them in step with your contract.
+        Models without a price show no cost rather than a guess.</p>
       <div class="table-scroll"><table>
         <thead><tr><th>Model</th><th class="num">Turns</th><th>Last used</th>
           ${PRICE_FIELDS.map(([, label]) => `<th class="num">${label}</th>`).join("")}
@@ -1219,6 +1228,293 @@ async function viewPrices() {
   }
 
   await load();
+}
+
+// ---------------------------------------------------------------- price import (specs/price-import)
+
+// parseFeed, classifyModels, buildPriceBody and the PRICE_* constants are globals
+// from price-import.js, which index.html loads first; it is a separate file so
+// the unit tests can run it under Node (plan D-a).
+const PRICE_FEED_TIMEOUT_MS = 15000;
+const PRICE_LABELS = Object.fromEntries(PRICE_FIELDS);
+const PRICE_IMPORT_STATUS = {
+  "importable": ["importable", "ok", "the feed has a list price that differs from the current one"],
+  "unchanged": ["unchanged", "", "the feed's input and output prices equal the current ones"],
+  "no-match": ["no match", "", "no feed entry has this model's normalized name; price it by hand"],
+  "ambiguous": ["ambiguous", "warn", "more than one feed entry has this model's normalized name; price it by hand"],
+  "not-priced": ["not priced in feed", "", "the feed lists this model without a usable input and output price"],
+};
+
+const feedError = (message) => Object.assign(new Error(message), { feed: true });
+const tooLarge = () => feedError("the feed is larger than 5 MB");
+
+async function readFeedBody(res) {
+  if (Number(res.headers.get("Content-Length")) > PRICE_FEED_MAX_BYTES) throw tooLarge();
+  if (!res.body || !res.body.getReader) return res.text();
+  // Streamed with a running count so an oversized body is dropped before it
+  // is held in memory whole, whatever Content-Length claimed.
+  const reader = res.body.getReader();
+  const chunks = [];
+  let size = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    size += value.byteLength;
+    if (size > PRICE_FEED_MAX_BYTES) { reader.cancel(); throw tooLarge(); }
+    chunks.push(value);
+  }
+  const bytes = new Uint8Array(size);
+  let offset = 0;
+  for (const c of chunks) { bytes.set(c, offset); offset += c.byteLength; }
+  return new TextDecoder().decode(bytes);
+}
+
+async function fetchPriceFeed() {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), PRICE_FEED_TIMEOUT_MS);
+  const timedOut = () => feedError("benchlm.ai did not answer within 15 seconds");
+  try {
+    let res;
+    try {
+      // No credentials and no referrer. benchlm.ai still sees the admin's IP
+      // address and, via Origin, the console's host (spec, Security considerations).
+      res = await fetch(PRICE_FEED_URL, {
+        credentials: "omit", referrerPolicy: "no-referrer", cache: "no-store", signal: ctrl.signal,
+      });
+    } catch (e) {
+      if (ctrl.signal.aborted) throw timedOut();
+      throw feedError("the request failed or was blocked — offline, a proxy, a content-security " +
+                      "policy or CORS (the browser does not say which)");
+    }
+    if (!res.ok) throw feedError(`benchlm.ai answered HTTP ${res.status}`);
+    let text;
+    try {
+      text = await readFeedBody(res);
+    } catch (e) {
+      if (ctrl.signal.aborted) throw timedOut();
+      throw e.feed ? e : feedError("the download was interrupted");
+    }
+    const feed = parseFeed(text);
+    if (!feed.ok) throw feedError(feed.error);
+    return feed;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function priceImportCard(getModels, reloadPrices) {
+  const card = document.createElement("div");
+  card.className = "card";
+  // Selection, typed cache prices and results are keyed by model name, which
+  // the price page lists once each, so they survive re-classification.
+  const st = { phase: "idle", error: "", notice: "", feed: null, rows: [], ticked: new Set(),
+               cache: new Map(), results: new Map(), applying: false, signedOut: false };
+
+  const selected = () => st.rows.filter((r) => st.ticked.has(r.model));
+
+  function resultHtml(res) {
+    if (!res) return "";
+    if (res.state === "saving") return '<span class="pi-result">saving…</span>';
+    if (res.state === "ok") return '<span class="pi-result ok">✓ applied</span>';
+    if (res.state === "fail") return `<span class="pi-result fail">✕ not applied: ${esc(res.message)}</span>`;
+    return '<span class="pi-result">not applied</span>';
+  }
+
+  function cacheRowHtml(r, i) {
+    const vals = st.cache.get(r.model) || {};
+    return `<tr class="pi-cache-row"><td></td><td colspan="8"><div class="pi-cache">
+      <span class="helper-text">No price is set for this model and the feed has no cache
+        prices. Enter them, in USD per million tokens, to apply it.</span>
+      ${PRICE_CACHE_FIELDS.map((f) => `<label class="pi-cache-field">
+        <span class="microlabel">${PRICE_LABELS[f]}</span>
+        <input class="price-input" type="number" min="0" max="10000" step="any"
+          data-i="${i}" data-field="${f}" value="${esc(vals[f] || "")}"
+          ${st.applying ? "disabled" : ""}></label>`).join("")}
+    </div></td></tr>`;
+  }
+
+  function rowHtml(r, i) {
+    const ticked = st.ticked.has(r.model);
+    const [label, cls, why] = PRICE_IMPORT_STATUS[r.status];
+    const now = (f) => (r.current ? "$" + esc(r.current[f]) : '<span class="pi-dim">unpriced</span>');
+    const feedVal = (v, changed) => (v == null ? '<span class="pi-dim">—</span>'
+      : `<span class="${changed ? "pi-changed" : "pi-dim"}">$${v}</span>`);
+    return `<tr class="${ticked ? "pi-ticked" : ""}">
+      <td>${r.tickable ? `<input type="checkbox" class="pi-tick" data-i="${i}"
+        ${ticked ? "checked" : ""} ${st.applying ? "disabled" : ""}
+        aria-label="Import the price for ${esc(r.model)}">` : ""}</td>
+      <td>${modelCell(r.model)}</td>
+      <td>${r.feedNames.length ? r.feedNames.map((n) => modelCell(n)).join("") : '<span class="pi-dim">—</span>'}</td>
+      <td class="num">${now("input")}</td><td class="num">${feedVal(r.feedInput, r.changed.input)}</td>
+      <td class="num">${now("output")}</td><td class="num">${feedVal(r.feedOutput, r.changed.output)}</td>
+      <td><span class="badge ${cls}" title="${esc(why)}">${label}</span></td>
+      <td>${resultHtml(st.results.get(r.model))}</td></tr>
+      ${ticked && !r.current ? cacheRowHtml(r, i) : ""}`;
+  }
+
+  function previewHtml() {
+    const f = st.feed;
+    const importable = st.rows.filter((r) => r.tickable).length;
+    return `
+      <p class="helper-text pi-source">Source:
+        <a href="https://benchlm.ai" target="_blank" rel="noopener noreferrer">benchlm.ai</a>
+        · feed updated ${f.lastUpdated ? esc(f.lastUpdated) : "(no date given)"}
+        · ${fmt(importable)} of ${fmt(st.rows.length)} models importable${f.skipped
+          ? ` · ${fmt(f.skipped)} unreadable feed entr${f.skipped === 1 ? "y" : "ies"} skipped` : ""}.
+        Input and output list prices only: the feed has no cache prices, so a model's
+        current cache prices are kept, and a model with no price needs them typed in.</p>
+      ${st.notice ? `<p class="row-error" role="alert">${esc(st.notice)}</p>` : ""}
+      ${st.signedOut ? '<p><button class="btn btn-accent pi-signin">Sign in again</button></p>' : ""}
+      <div class="table-scroll"><table>
+        <thead><tr><th></th><th>Model</th><th>Feed entry</th>
+          <th class="num">Input now</th><th class="num">Input feed</th>
+          <th class="num">Output now</th><th class="num">Output feed</th>
+          <th>Status</th><th>Result</th></tr></thead>
+        <tbody>${st.rows.map(rowHtml).join("") ||
+          '<tr><td colspan="9" class="empty">no models on this page yet</td></tr>'}</tbody>
+      </table></div>
+      <div class="pi-toolbar">
+        <button class="btn btn-accent pi-apply" disabled>Apply</button>
+        <button class="btn btn-ghost pi-all" ${st.applying || !importable ? "disabled" : ""}>select all importable</button>
+        <button class="btn btn-ghost pi-none" ${st.applying ? "disabled" : ""}>clear selection</button>
+        <span class="helper-text pi-blocked" aria-live="polite"></span>
+      </div>`;
+  }
+
+  function updateApply() {
+    const apply = card.querySelector(".pi-apply");
+    if (!apply) return;
+    const sel = selected();
+    const blocked = [];
+    sel.forEach((r) => {
+      const built = buildPriceBody(r, st.cache.get(r.model));
+      if (!built.ok) blocked.push(r.model);
+      const i = st.rows.indexOf(r);
+      card.querySelectorAll(`input[data-i="${i}"][data-field]`).forEach((el) => {
+        // Flag only what was typed and is wrong; an untouched empty field is
+        // simply still to do, and the line below the table says so.
+        const bad = el.validity.badInput
+          || (!built.ok && built.fields.includes(el.dataset.field) && el.value !== "");
+        el.classList.toggle("invalid", bad);
+        el.setAttribute("aria-invalid", String(bad));
+      });
+    });
+    apply.disabled = st.applying || st.signedOut || !sel.length || blocked.length > 0;
+    apply.textContent = st.applying ? "Applying…" : sel.length ? `Apply ${sel.length} selected` : "Apply";
+    card.querySelector(".pi-blocked").textContent = blocked.length
+      ? `Enter all three cache prices (0 to 10,000) for: ${blocked.join(", ")}` : "";
+  }
+
+  function render(focusSel) {
+    const busy = st.phase === "loading" || st.applying;
+    card.innerHTML = `
+      <div class="card-head pi-head"><span class="card-title">Import from benchlm.ai</span>
+        <div class="card-tools">
+          ${st.phase === "preview" ? `<button class="btn btn-ghost pi-close" ${busy ? "disabled" : ""}>close preview</button>` : ""}
+          <button class="btn pi-load" ${busy ? "disabled" : ""}>${st.phase === "loading" ? "Loading…" : "Load prices from benchlm.ai"}</button>
+        </div></div>
+      ${st.phase === "error" ? `<p class="row-error" role="alert">Could not load prices from benchlm.ai:
+        ${esc(st.error)}. No price was changed.</p>` : ""}
+      ${st.phase === "preview" ? previewHtml() : `<p class="helper-text">Fetches benchlm.ai's public list
+        prices from this browser and shows what would change. Nothing is saved until you tick
+        models and apply them.</p>`}`;
+
+    card.querySelector(".pi-load").addEventListener("click", loadFeed);
+    const close = card.querySelector(".pi-close");
+    if (close) close.addEventListener("click", () => { st.phase = "idle"; st.notice = ""; render(); });
+    if (st.phase !== "preview") return;
+
+    card.querySelectorAll(".pi-tick").forEach((el) => el.addEventListener("change", () => {
+      const r = st.rows[Number(el.dataset.i)];
+      if (el.checked) st.ticked.add(r.model); else st.ticked.delete(r.model);
+      render(`.pi-tick[data-i="${el.dataset.i}"]`);
+    }));
+    card.querySelectorAll("input[data-field]").forEach((el) => el.addEventListener("input", () => {
+      const r = st.rows[Number(el.dataset.i)];
+      st.cache.set(r.model, { ...st.cache.get(r.model), [el.dataset.field]: el.value });
+      updateApply();
+    }));
+    card.querySelector(".pi-all").addEventListener("click", () => {
+      st.rows.forEach((r) => { if (r.tickable) st.ticked.add(r.model); });
+      render();
+    });
+    card.querySelector(".pi-none").addEventListener("click", () => { st.ticked.clear(); render(); });
+    card.querySelector(".pi-apply").addEventListener("click", apply);
+    const signIn = card.querySelector(".pi-signin");
+    if (signIn) signIn.addEventListener("click", logout);
+    updateApply();
+    if (focusSel) { const el = card.querySelector(focusSel); if (el) el.focus(); }
+  }
+
+  async function loadFeed() {
+    st.phase = "loading";
+    render();
+    try {
+      st.feed = await fetchPriceFeed();
+      st.rows = classifyModels(getModels(), st.feed.entries);
+      st.ticked.clear(); st.cache.clear(); st.results.clear(); st.notice = ""; st.signedOut = false;
+      st.phase = "preview";
+    } catch (e) {
+      st.phase = "error";
+      st.error = e.feed ? e.message : `unexpected error (${e.message})`;
+    }
+    render();
+  }
+
+  async function apply() {
+    const work = selected().map((r) => [r, buildPriceBody(r, st.cache.get(r.model))]);
+    if (!work.length || work.some(([, built]) => !built.ok)) return;
+    st.applying = true;
+    st.notice = "";
+    // Only this run's rows lose their old result; earlier ones stay visible.
+    work.forEach(([r]) => st.results.delete(r.model));
+    render();
+    // One at a time so each row gets its own answer, and a failure touches
+    // only its row (spec AC10, plan D-d).
+    for (const [r, built] of work) {
+      if (st.signedOut) { st.results.set(r.model, { state: "skipped" }); continue; }
+      st.results.set(r.model, { state: "saving" });
+      render();
+      try {
+        await api("/api/v1/models/prices",
+                  { method: "PUT", body: JSON.stringify(built.body), keepSession: true });
+        st.results.set(r.model, { state: "ok" });
+      } catch (e) {
+        // Every later row would fail the same way, so stop. The session is
+        // kept until the admin has seen which rows saved (spec use case 6).
+        st.signedOut = e.message === "unauthorized";
+        st.results.set(r.model, { state: "fail",
+                                  message: st.signedOut ? "your session expired" : e.message });
+      }
+    }
+    st.applying = false;
+    if (st.signedOut) {
+      st.notice = "Your session expired. Rows marked ✓ applied were saved; the others were not. " +
+                  "Sign in again to apply them.";
+      render();
+      return;
+    }
+    // load() calls refresh(), which re-classifies: applied rows become
+    // "unchanged" and drop out of the selection; failed rows stay ticked.
+    try {
+      await reloadPrices();
+    } catch (e) {
+      st.notice = `The prices could not be reloaded (${e.message}); refresh the page to see them.`;
+      render();
+    }
+  }
+
+  // Called after every load of the price table, so the preview never offers
+  // (or re-sends) prices that a hand edit on this page has since replaced.
+  card.refresh = () => {
+    if (st.phase !== "preview" || st.applying) return;
+    st.rows = classifyModels(getModels(), st.feed.entries);
+    st.ticked = new Set(st.rows.filter((r) => r.tickable && st.ticked.has(r.model)).map((r) => r.model));
+    render();
+  };
+
+  render();
+  return card;
 }
 
 // ---------------------------------------------------------------- users

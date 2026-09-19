@@ -43,6 +43,10 @@ if [ -d tests ]; then
   else
     python3 -m unittest discover -s tests -q || [ $? -eq 5 ]  # 5 = none collected (3.12+)
   fi
+  # The price-import logic is browser JS, tested under Node (specs/price-import,
+  # plan D-b); without Node those tests skip, and "tests OK" would hide that.
+  command -v node >/dev/null 2>&1 \
+    || echo "WARNING: node not on PATH — tests/test_price_import.py was skipped" >&2
   echo "tests OK"
 fi
 

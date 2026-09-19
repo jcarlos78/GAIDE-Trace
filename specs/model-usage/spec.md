@@ -270,7 +270,9 @@ Robustness against hostile stored data *(added 2026-09-14 after security review)
   price history, no per-date prices, no currency other than USD.
 - **Premium-speed pricing and batch/priority tiers.** Flagged (AC19), not priced.
 - **Fetching prices from any provider.** No network access; no shipped default
-  price table in the repository.
+  price table in the repository. Amended by `specs/price-import`: an admin can
+  load input/output list prices from benchlm.ai in the browser and apply them
+  after review; the server still makes no outbound request.
 - **Budgets, alerts or quotas** on cost.
 - **The pandas analysis toolkit** (`analysis/load_trace.py`) has the same
   per-line duplication in `load_transcripts`. Fixing it is a separate change.

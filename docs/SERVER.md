@@ -43,8 +43,8 @@ anything else works. From there, everything is managed visually:
 - **Projects** — register a project; the server generates an ingest-only key
   and a ready-to-paste **install prompt** (see §2).
 - **API keys** — advanced: raw bearer keys for scripts/CI.
-- **Model prices** — per-model USD prices behind the console's cost estimates
-  (see §7).
+- **Model prices** — per-model USD prices behind the console's cost estimates,
+  set by hand or loaded from benchlm.ai after review (see §7).
 
 Locked out? Reset any account from the server shell:
 
@@ -317,6 +317,27 @@ prices current when you look (no price history), returned unrounded.
   5-minute rate.
 
 Prices are configuration, like users and keys: `rebuild-index` keeps them.
+
+**Loading list prices from benchlm.ai.** On the Model prices page, **Load
+prices from benchlm.ai** fetches benchlm.ai's public pricing feed
+(`https://benchlm.ai/api/data/pricing`) *from the admin's browser* — the server
+makes no outbound request, and the request carries no cookies, referrer or
+GAIDE-Trace data. benchlm.ai does see the admin's IP address and, through the
+`Origin` header every cross-origin request carries, the console's host name. Nothing changes until
+the admin ticks models in the preview and applies them; each is then saved
+through `PUT /api/v1/models/prices` like a hand edit, with the admin as author.
+
+- Models are matched by normalized name (lowercase, punctuation runs → `-`,
+  trailing `-YYYYMMDD` dropped), so `Claude Opus 5` matches `claude-opus-5`.
+  Only exact, unique matches are importable; others show *no match*,
+  *ambiguous* or *not priced in feed* and stay hand-priced.
+- The feed has **input and output prices only**. Applying keeps a model's
+  current cache prices; a model with no price yet needs its three cache prices
+  typed in before it can be applied. Nothing fills them in.
+- Open-weight models listed at `0` are treated as unpriced, not free.
+- A blocked or failing fetch (offline, a proxy, a content-security policy,
+  CORS, a 15-second timeout, a malformed or oversized feed) shows an error and
+  changes nothing; hand pricing is unaffected.
 
 ## 8. Security notes
 

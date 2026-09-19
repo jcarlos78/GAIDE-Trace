@@ -2,6 +2,8 @@
 
 `unittest`-style tests, standard library only — the same constraint as the code under test (see `AGENTS.md`, Tech stack). Run them with `python3 -m unittest discover -s tests` or `pytest -q`, or via `./init.sh`, which runs the whole bring-up and uses pytest only when it is installed.
 
+`test_price_import.py` is the one exception to "Python only": the price-import logic ships as browser JS (`server/webui/price-import.js`), so the test drives that exact file through `node`. Node is an optional test-time tool, never a runtime dependency. Without it those tests skip with a reason and `./init.sh` prints a warning.
+
 Shared, synthesized fixtures live in `tests/fixtures.py` and are imported as a top-level module, so run tests through discovery or pytest rather than as `tests.<module>`.
 
 ## State of the suite
